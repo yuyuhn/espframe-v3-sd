@@ -1,0 +1,27 @@
+# =============================================================================
+# LOCAL SD MODE — STUB (non-SD variants)
+# =============================================================================
+# The shared Immich/backlight files (backlight_schedule.yaml, immich_config.yaml,
+# immich_slideshow.yaml, screen_slideshow.yaml) reference two SD-only IDs:
+#   - `local_mode_enabled`   (the "Local SD mode" template switch)
+#   - `local_slideshow_page` (the local photo LVGL page)
+# Those shared files are included by every panel variant, so the IDs must resolve
+# even where the SD feature is compiled out. This stub defines them as inert
+# placeholders: the switch is always off (internal, never exposed) and the page is
+# blank and never shown. The real definitions live in screen_local_slideshow.yaml,
+# which is included only by the -sd build.
+# =============================================================================
+
+switch:
+  - platform: template
+    name: "Local SD mode"
+    id: local_mode_enabled
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    internal: true
+
+lvgl:
+  pages:
+    - id: local_slideshow_page
+      bg_color: 0x000000
+      scrollable: false

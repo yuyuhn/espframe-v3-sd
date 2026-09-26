@@ -1,0 +1,178 @@
+# =============================================================================
+# SCREEN: LOCAL SD PHOTO SLIDESHOW (offline mode)
+# =============================================================================
+# Standalone local photo frame: reads images from /sdcard/PHOTOS and cycles
+# through them using a single OnlineImage driven via "file://" URLs. Deliberately
+# isolated from the Immich state machine — enable it with the "Local SD Mode"
+# switch, which pauses the Immich slide screen and shows this page instead.
+# =============================================================================
+
+substitutions:
+  local_slide_interval: "15 seconds"
+
+# -----------------------------------------------------------------------------
+# Decode/display carrier (reuses remote_image's decode + LVGL pipeline)
+# -----------------------------------------------------------------------------
+remote_image:
+  - id: local_img_0
+    url: "file:///sdcard/PHOTOS"
+    resize: ${display_width}x${display_height}
+    type: RGB565
+    byte_order: little_endian
+    formats: [JPEG, WEBP, PNG, BMP]
+    on_download_finished:
+      then:
+        - script.execute: local_display_current
+    on_error:
+      then:
+        - lambda: |-
+            ESP_LOGW("local", "Failed to decode local photo");
+            lv_obj_clear_flag(id(local_empty_overlay), LV_OBJ_FLAG_HIDDEN);
+
+# -----------------------------------------------------------------------------
+# Directory enumeration + rotation driver
+# -----------------------------------------------------------------------------
+local_photo_frame:
+  id: local_frame
+  image_id: local_img_0
+  sd_mmc_card_id: sd_card_reader
+  photos_dir: "/sdcard/PHOTOS"
+  update_interval: ${local_slide_interval}
+
+text_sensor:
+  - platform: local_photo_frame
+    local_photo_frame_id: local_frame
+    name: "Local Photos Status"
+    entity_category: diagnostic
+
+# -----------------------------------------------------------------------------
+# Browser upload endpoint (POST /upload) + form (GET /local)
+# -----------------------------------------------------------------------------
+local_upload:
+  id: local_uploader
+  local_photo_frame_id: local_frame
+  photos_dir: "/sdcard/PHOTOS"
+
+# -----------------------------------------------------------------------------
+# LVGL UI
+# -----------------------------------------------------------------------------
+lvgl:
+  pages:
+    - id: local_slideshow_page
+      bg_color: 0x000000
+      scrollable: false
+      widgets:
+        - image:
+            id: local_slideshow_img
+            align: CENTER
+            src: local_img_0
+            scrollable: false
+            clickable: true
+            on_short_click:
+              then:
+                - lambda: 'id(local_frame).next();'
+        - obj:
+            id: local_empty_overlay
+            align: CENTER
+            width: ${display_width}
+            height: ${display_height}
+            bg_color: 0x000000
+            bg_opa: 100%
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            clickable: false
+            hidden: true
+            layout:
+              type: flex
+              flex_flow: COLUMN
+              flex_align_main: CENTER
+              flex_align_cross: CENTER
+              pad_row: 16
+            widgets:
+              - label:
+                  id: local_empty_title
+                  text: "No photos found"
+                  text_align: center
+                  text_color: 0xFFFFFF
+                  text_font: noto_400_46_font
+              - label:
+                  id: local_empty_subtitle
+                  text: "Add .jpg or .png images to\n/sdcard/PHOTOS on the SD card."
+                  text_align: center
+                  text_color: 0x888888
+                  text_font: noto_400_30_font
+
+# -----------------------------------------------------------------------------
+# Scripts
+# -----------------------------------------------------------------------------
+script:
+  - id: show_local_slideshow
+    mode: single
+    then:
+      - lambda: |-
+          // Resume (or first-start) the local rotation. The first resume triggers
+          // a directory rescan and loads photo #1 when idle.
+          id(local_frame).set_paused(false);
+      - lambda: |-
+          if (id(local_frame).photo_count() == 0) {
+            lv_obj_clear_flag(id(local_empty_overlay), LV_OBJ_FLAG_HIDDEN);
+          }
+      - lvgl.page.show: local_slideshow_page
+
+  - id: hide_local_slideshow
+    mode: single
+    then:
+      - lambda: 'id(local_frame).set_paused(true);'
+      - lvgl.page.show: slideshow_page
+
+  - id: local_display_current
+    mode: single
+    then:
+      - lambda: |-
+          auto *dsc = get_lv_image_descriptor_(id(local_img_0), 0);
+          if (dsc == nullptr || dsc->data == nullptr ||
+              id(local_img_0).get_width() <= 0 || id(local_img_0).get_height() <= 0) {
+            return;
+          }
+          lv_img_set_src(id(local_slideshow_img), dsc);
+          lv_img_set_zoom(id(local_slideshow_img), ZOOM_IDENTITY);
+          lv_obj_add_flag(id(local_empty_overlay), LV_OBJ_FLAG_HIDDEN);
+          lv_obj_clear_flag(id(local_slideshow_img), LV_OBJ_FLAG_HIDDEN);
+          lv_obj_invalidate(id(local_slideshow_page)->obj);
+
+# -----------------------------------------------------------------------------
+# Entry point: a web-server toggle switches between Immich and local mode
+# -----------------------------------------------------------------------------
+switch:
+  - platform: template
+    name: "Local SD mode"
+    id: local_mode_enabled
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    icon: "mdi:sd"
+    web_server:
+      sorting_group_id: sg_photos
+    on_turn_on:
+      then:
+        - script.execute: show_local_slideshow
+    on_turn_off:
+      then:
+        - script.execute: hide_local_slideshow
+
+# -----------------------------------------------------------------------------
+# Boot routing: the template switch restores its state on boot, but the
+# on_turn_on automation does not fire on restore. Route here explicitly so a
+# device that was left in Local SD mode comes back to the local slideshow
+# instead of sitting on the loading screen ("Connected").
+# -----------------------------------------------------------------------------
+esphome:
+  on_boot:
+    - priority: 0
+      then:
+        - delay: 2s
+        - if:
+            condition:
+              lambda: 'return id(local_mode_enabled).state;'
+            then:
+              - script.execute: show_local_slideshow

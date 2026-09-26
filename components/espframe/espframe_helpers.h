@@ -1,0 +1,296 @@
+#pragma once
+#include "date_utils.h"
+#include "duration_helpers.h"
+#include "immich_helpers.h"
+#include "ntp_helpers.h"
+#include "sun_calc.h"
+#include "slideshow_model.h"
+#include "slideshow_controller.h"
+#include "slideshow_component.h"
+#include "photo_buffer_ownership.h"
+#include <string>
+#include <cstdint>
+#include <cstring>
+#include <cmath>
+#include <type_traits>
+#include "esp_heap_caps.h"
+#include "esphome/core/hal.h"
+
+#ifdef USE_LVGL
+#include "esphome/components/image/image.h"
+#include "photo_buffer_lvgl.h"
+#endif
+
+// Shared helpers used from ESPHome YAML lambdas. Keeping this logic in C++ keeps
+// the YAML readable and gives the slideshow, backlight, and warm-tone
+// flows a single set of small, testable building blocks.
+static constexpr int MAX_ERROR_RETRIES = 3;
+static constexpr int WARM_TONE_LEAD_MINUTES = 60;
+
+inline int minutes_since_midnight(int h, int m) { return h * 60 + m; }
+
+inline bool is_daytime(int now_h, int now_m, int rise_h, int rise_m, int set_h, int set_m) {
+  int now_min = minutes_since_midnight(now_h, now_m);
+  int rise_min = minutes_since_midnight(rise_h, rise_m);
+  int set_min = minutes_since_midnight(set_h, set_m);
+  return now_min >= rise_min && now_min < set_min;
+}
+
+inline std::string format_time_12h(int h, int m) {
+  char buf[16];
+  const char *suffix = (h >= 12) ? "PM" : "AM";
+  int dh = h % 12;
+  if (dh == 0) dh = 12;
+  snprintf(buf, sizeof(buf), "%d:%02d %s", dh, m, suffix);
+  return buf;
+}
+
+inline bool is_http_auth_error(int status) { return status == 401; }
+inline bool is_http_retryable(int status) { return status >= 500 || status == 429; }
+inline bool is_http_client_error(int status) {
+  return status >= 400 && status < 500 && !is_http_auth_error(status) && status != 429;
+}
+
+template<typename Target>
+inline void set_url_on(Target &&image, const std::string &url) {
+  using Image = std::remove_reference_t<Target>;
+  if constexpr (std::is_pointer_v<Image>) {
+    image->set_url(url);
+  } else {
+    image.set_url(url);
+  }
+}
+
+template<typename Target>
+inline void execute_script_on(Target &&script) {
+  using Script = std::remove_reference_t<Target>;
+  if constexpr (std::is_pointer_v<Script>) {
+    script->execute();
+  } else {
+    script.execute();
+  }
+}
+
+template<typename Image0, typename Image1, typename Image2>
+inline void set_slot_image_url(int slot, const std::string &url,
+                               Image0 &image0, Image1 &image1, Image2 &image2) {
+  if (slot == 0) set_url_on(image0, url);
+  else if (slot == 1) set_url_on(image1, url);
+  else set_url_on(image2, url);
+}
+
+template<typename Script0, typename Script1, typename Script2>
+inline void execute_deferred_slot_image_update(int slot,
+                                               Script0 &slot0_update,
+                                               Script1 &slot1_update,
+                                               Script2 &slot2_update) {
+  if (slot == 0) execute_script_on(slot0_update);
+  else if (slot == 1) execute_script_on(slot1_update);
+  else execute_script_on(slot2_update);
+}
+
+inline void log_immich_pipeline_diag(const char *reason, uint32_t now_ms, uint32_t &last_diag_ms,
+    int active_slot, int target_slot, bool active_displayed, const SlotFlags &flags,
+    const PortraitState &portrait, int nc_count, bool preload_nc_in_flight,
+    int portrait_preload_slot, bool portrait_preload_left_ready, bool portrait_preload_right_ready,
+    int companion_target_slot, int api_retries, int download_retries, uint32_t retry_cooldown_until_ms) {
+  if (last_diag_ms != 0 && (now_ms - last_diag_ms) < 5000) return;
+  last_diag_ms = now_ms;
+
+  size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  size_t largest_heap = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+  size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+  size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
+  size_t largest_psram = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
+  uint32_t cooldown_left = (retry_cooldown_until_ms != 0 && now_ms < retry_cooldown_until_ms)
+                               ? (retry_cooldown_until_ms - now_ms)
+                               : 0;
+
+  ESP_LOGW("diag",
+           "IMMICH-DIAG %s heap=%u/%u internal=%u/%u psram=%u/%u active=%d target=%d displayed=%d "
+           "slot_flight=%d%d%d nc=%d preload_nc=%d portrait_busy=%d left_req=%d "
+           "left_ready=%d right_req=%d right_ready=%d companion=%d pair=%d "
+           "preload_slot=%d preload_ready=%d/%d companion_slot=%d retries=%d/%d cooldown=%u",
+           reason, (unsigned) free_heap, (unsigned) largest_heap,
+           (unsigned) free_internal, (unsigned) largest_internal,
+           (unsigned) free_psram, (unsigned) largest_psram, active_slot, target_slot,
+           active_displayed, flags.fetch_in_flight[0], flags.fetch_in_flight[1],
+           flags.fetch_in_flight[2], nc_count, preload_nc_in_flight, portrait.workflow_busy,
+           portrait.left_requested, portrait.left_ready, portrait.right_requested,
+           portrait.right_ready, portrait.companion_found, portrait.is_pair,
+           portrait_preload_slot, portrait_preload_left_ready, portrait_preload_right_ready,
+           companion_target_slot, api_retries, download_retries, (unsigned) cooldown_left);
+}
+
+inline std::string decode_url_commas(const std::string &input) {
+  std::string v = input;
+  for (size_t p = v.find("%2C"); p != std::string::npos; p = v.find("%2C", p + 1))
+    v.replace(p, 3, ",");
+  for (size_t p = v.find("%2c"); p != std::string::npos; p = v.find("%2c", p + 1))
+    v.replace(p, 3, ",");
+  return v;
+}
+
+// ============================================================================
+// Immich asset parser — parse JSON and fill one of the three slot metas
+// ============================================================================
+// body: JSON string (single asset object or array with one object).
+// base_url: Immich server base URL (no trailing slash).
+// slot: target slot index (0, 1, or 2).
+// s0, s1, s2: references to the three SlotMeta globals.
+// Returns the image URL on success, empty string on parse failure.
+
+#ifdef USE_LVGL
+template<typename T> auto get_lv_image_descriptor_(T *img, int) -> decltype(img->get_lv_image_dsc()) {
+  return img->get_lv_image_dsc();
+}
+
+template<typename T> auto get_lv_image_descriptor_(T *img, long) -> decltype(img->get_lv_img_dsc()) {
+  return img->get_lv_img_dsc();
+}
+#endif
+
+// ============================================================================
+// Warm tone helpers — LUT-based RGB565 tinting
+// ============================================================================
+
+inline float calc_sun_warmth(int now_min, int rise_min, int set_min, int lead_min) {
+  // Returns a 0..1 intensity: fully warm before sunrise/after sunset, then
+  // cross-faded around sunrise and sunset.
+  if (now_min >= set_min) return 1.0f;
+  if (now_min >= set_min - lead_min)
+    return (float)(now_min - (set_min - lead_min)) / lead_min;
+  if (now_min < rise_min) return 1.0f;
+  if (now_min < rise_min + lead_min)
+    return 1.0f - (float)(now_min - rise_min) / lead_min;
+  return 0.0f;
+}
+
+struct WarmToneLuts {
+  uint8_t r[32];
+  uint8_t g[64];
+  uint8_t b[32];
+};
+
+inline void build_warm_tone_luts(float last_w, float new_w, WarmToneLuts &luts) {
+  // Build lookup tables that first undo the previous tint, then apply the new
+  // tint. This prevents repeated warm-tone updates from permanently drifting
+  // the image colors.
+  float r_undo = (last_w > 0.005f) ? 1.0f / (1.0f + last_w * 0.06f) : 1.0f;
+  float g_undo = (last_w > 0.005f) ? 1.0f / (1.0f - last_w * 0.07f) : 1.0f;
+  float b_undo = (last_w > 0.005f) ? 1.0f / (1.0f - last_w * 0.28f) : 1.0f;
+  float r_apply = 1.0f + new_w * 0.06f;
+  float g_apply = 1.0f - new_w * 0.07f;
+  float b_apply = 1.0f - new_w * 0.28f;
+
+  for (int i = 0; i < 32; i++) {
+    int v = (i << 3) | (i >> 2);
+    int nv = (int)(v * r_undo * r_apply);
+    luts.r[i] = (uint8_t)((nv > 255 ? 255 : (nv < 0 ? 0 : nv)) >> 3);
+  }
+  for (int i = 0; i < 64; i++) {
+    int v = (i << 2) | (i >> 4);
+    int nv = (int)(v * g_undo * g_apply);
+    luts.g[i] = (uint8_t)((nv > 255 ? 255 : (nv < 0 ? 0 : nv)) >> 2);
+  }
+  for (int i = 0; i < 32; i++) {
+    int v = (i << 3) | (i >> 2);
+    int nv = (int)(v * b_undo * b_apply);
+    luts.b[i] = (uint8_t)((nv > 255 ? 255 : (nv < 0 ? 0 : nv)) >> 3);
+  }
+}
+
+#ifdef USE_LVGL
+inline void tint_image_buffer(esphome::image::Image *img, const WarmToneLuts &luts) {
+  if (!img) return;
+  lv_img_dsc_t *dsc = get_lv_image_descriptor_(img, 0);
+  if (!dsc || !dsc->data) return;
+  uint8_t *buf = const_cast<uint8_t*>(dsc->data);
+  int total = img->get_width() * img->get_height();
+  // RGB565 stores only 5/6/5 bits per channel, so the LUTs operate directly on
+  // those channel indices instead of converting every pixel through RGB888.
+  for (int i = 0; i < total; i++) {
+    int pos = i * 2;
+    uint16_t px = buf[pos] | (buf[pos + 1] << 8);
+    uint8_t r5 = luts.r[(px >> 11) & 0x1F];
+    uint8_t g6 = luts.g[(px >> 5) & 0x3F];
+    uint8_t b5 = luts.b[px & 0x1F];
+    uint16_t out = (r5 << 11) | (g6 << 5) | b5;
+    buf[pos]     = out & 0xFF;
+    buf[pos + 1] = (out >> 8) & 0xFF;
+  }
+}
+#endif  // USE_LVGL
+
+#ifdef USE_JSON
+inline void fill_slot_from_immich_meta(const ImmichAssetMeta &tmp,
+                                       int slot,
+                                       SlotMeta &s0, SlotMeta &s1, SlotMeta &s2) {
+  SlotMeta *meta = (slot == 0) ? &s0 : (slot == 1) ? &s1 : &s2;
+  meta->asset_id = tmp.asset_id;
+  meta->image_url = tmp.image_url;
+  meta->date = tmp.date;
+  meta->location = tmp.location;
+  meta->person = tmp.person;
+  meta->year = tmp.year;
+  meta->month = tmp.month;
+  meta->day = tmp.day;
+  meta->zoom = tmp.zoom;
+  meta->datetime = tmp.datetime;
+  meta->filter_album_ids = tmp.filter_album_ids;
+  meta->filter_person_ids = tmp.filter_person_ids;
+  meta->filter_tag_ids = tmp.filter_tag_ids;
+  meta->companion_url = "";
+  meta->pending_asset_id = tmp.asset_id;
+  meta->is_portrait = tmp.is_portrait;
+}
+
+inline std::string take_immich_candidate_and_fill_slot(
+    std::vector<ImmichAssetMeta> &pool, int slot,
+    SlotMeta &s0, SlotMeta &s1, SlotMeta &s2) {
+  while (!pool.empty()) {
+    ImmichAssetMeta candidate = std::move(pool.back());
+    pool.pop_back();
+    if (candidate.asset_id.empty()) continue;
+    if (candidate.asset_id == s0.asset_id || candidate.asset_id == s1.asset_id ||
+        candidate.asset_id == s2.asset_id || candidate.asset_id == s0.pending_asset_id ||
+        candidate.asset_id == s1.pending_asset_id || candidate.asset_id == s2.pending_asset_id) {
+      continue;
+    }
+    fill_slot_from_immich_meta(candidate, slot, s0, s1, s2);
+    return candidate.image_url;
+  }
+  return "";
+}
+
+inline std::string parse_immich_asset_and_fill_slot(const std::string &body,
+                                                    const std::string &base_url,
+                                                    int slot,
+                                                    SlotMeta &s0, SlotMeta &s1, SlotMeta &s2,
+                                                    const std::string &orientation_filter = "Any") {
+  // Parse once into an intermediate struct, then copy the fields into the slot
+  // selected by the YAML state machine.
+  ImmichAssetMeta tmp;
+  std::string img_url = parse_immich_asset(body, base_url, &tmp, orientation_filter);
+  if (img_url.empty()) return "";
+
+  fill_slot_from_immich_meta(tmp, slot, s0, s1, s2);
+  return img_url;
+}
+
+inline std::string parse_immich_metadata_asset_and_fill_slot(
+                                                    const std::string &body,
+                                                    const std::string &base_url,
+                                                    int slot,
+                                                    SlotMeta &s0, SlotMeta &s1, SlotMeta &s2,
+                                                    const std::string &orientation_filter = "Any") {
+  ImmichAssetMeta tmp;
+  std::string img_url = parse_immich_metadata_asset(body, base_url, &tmp, orientation_filter);
+  if (img_url.empty()) return "";
+
+  fill_slot_from_immich_meta(tmp, slot, s0, s1, s2);
+  return img_url;
+}
+
+#endif  // USE_JSON

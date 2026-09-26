@@ -1,0 +1,225 @@
+name: PR Validation
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 3 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate PR Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install pinned timezone data
+        shell: bash
+        run: |
+          TZDATA_VENV="${RUNNER_TEMP}/espframe-tzdata"
+          python3 -m venv "${TZDATA_VENV}"
+          "${TZDATA_VENV}/bin/python" -m pip install \
+            --disable-pip-version-check \
+            "tzdata==2026.3"
+          TZDATA_SITE="$("${TZDATA_VENV}/bin/python" -c 'import site; print(site.getsitepackages()[0])')"
+          echo "PYTHONPATH=${TZDATA_SITE}${PYTHONPATH:+:${PYTHONPATH}}" >> "${GITHUB_ENV}"
+          echo "PYTHONTZPATH=${TZDATA_SITE}/tzdata/zoneinfo" >> "${GITHUB_ENV}"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run PR checks
+        run: npm run check:pr
+
+  firmware-metadata:
+    name: Read Firmware Build Metadata
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: espframe
+    timeout-minutes: 5
+    outputs:
+      release_matrix: ${{ steps.product.outputs.release_matrix }}
+      esphome_docker_image: ${{ steps.product.outputs.esphome_docker_image }}
+      esphome_version: ${{ steps.product.outputs.esphome_version }}
+      esphome_config_mount: ${{ steps.product.outputs.esphome_config_mount }}
+      esphome_docker_remove_flag: ${{ steps.product.outputs.esphome_docker_remove_flag }}
+      release_esphome_cache_dir: ${{ steps.product.outputs.release_esphome_cache_dir }}
+      release_esphome_cache_key_prefix: ${{ steps.product.outputs.release_esphome_cache_key_prefix }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            scripts/product_config.py
+            product/contract/devices.json
+            product/contract/manifest.json
+            product/contract/project.json
+            product/contract/settings.json
+          sparse-checkout-cone-mode: false
+
+      - name: Read product metadata
+        id: product
+        run: python3 scripts/product_config.py github-output >> "$GITHUB_OUTPUT"
+
+  compile:
+    name: Compile Firmware
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: espframe
+    needs: [validate, firmware-metadata]
+    timeout-minutes: 30
+    env:
+      ESPHOME_DOCKER_IMAGE: ${{ needs.firmware-metadata.outputs.esphome_docker_image }}
+      ESPHOME_VERSION: ${{ needs.firmware-metadata.outputs.esphome_version }}
+      ESPHOME_CONFIG_MOUNT: ${{ needs.firmware-metadata.outputs.esphome_config_mount }}
+      ESPHOME_DOCKER_REMOVE_FLAG: ${{ needs.firmware-metadata.outputs.esphome_docker_remove_flag }}
+      RELEASE_ESPHOME_CACHE_DIR: ${{ needs.firmware-metadata.outputs.release_esphome_cache_dir }}
+      RELEASE_ESPHOME_CACHE_KEY_PREFIX: ${{ needs.firmware-metadata.outputs.release_esphome_cache_key_prefix }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJson(needs.firmware-metadata.outputs.release_matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Reclaim runner Docker storage
+        run: |
+          set -euo pipefail
+          docker system df || true
+          docker container prune -f
+          docker image prune -af
+          docker builder prune -af --keep-storage 2GB
+          docker volume prune --all --force
+          docker pull "${ESPHOME_DOCKER_IMAGE}:${ESPHOME_VERSION}"
+          docker system df
+
+      - name: Cache ESPHome build
+        uses: actions/cache@v6
+        with:
+          path: ${{ needs.firmware-metadata.outputs.release_esphome_cache_dir }}
+          key: ${{ needs.firmware-metadata.outputs.release_esphome_cache_key_prefix }}-${{ matrix.slug }}-${{ hashFiles('builds/*.yaml', 'common/**', 'devices/**', 'components/**') }}
+          restore-keys: |
+            ${{ needs.firmware-metadata.outputs.release_esphome_cache_key_prefix }}-${{ matrix.slug }}-
+
+      - name: Compile test firmware artifacts
+        run: |
+          set -euo pipefail
+          TEST_VERSION="pr-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p output
+          image="${ESPHOME_DOCKER_IMAGE}:${ESPHOME_VERSION}"
+          workspace_volume="espframe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.slug }}"
+          staging_container=""
+
+          cleanup_workspace() {
+            if [ -n "${staging_container}" ]; then
+              docker rm -f "${staging_container}" >/dev/null 2>&1 || true
+            fi
+            docker volume rm -f "${workspace_volume}" >/dev/null 2>&1 || true
+          }
+          trap cleanup_workspace EXIT
+
+          docker volume create "${workspace_volume}" >/dev/null
+          staging_container=$(docker create \
+            --user "$(id -u):$(id -g)" \
+            --mount "type=volume,source=${workspace_volume},target=${ESPHOME_CONFIG_MOUNT}" \
+            --entrypoint /bin/true \
+            "${image}")
+          docker cp --archive "${PWD}/." "${staging_container}:${ESPHOME_CONFIG_MOUNT}"
+          docker rm "${staging_container}" >/dev/null
+          staging_container=""
+          rm -rf "${RELEASE_ESPHOME_CACHE_DIR}"
+          mkdir -p "${RELEASE_ESPHOME_CACHE_DIR}"
+
+          compile_in_isolated_container() {
+            local config_file="$1"
+            local profile="$2"
+            local binary_name="$3"
+            local log_file="output/${{ matrix.slug }}.${profile}.log"
+            local output_binary="output/${{ matrix.slug }}.${profile}.bin"
+            local container
+            container=$(docker create \
+              --user "$(id -u):$(id -g)" \
+              -e HOME="${ESPHOME_CONFIG_MOUNT}" \
+              -e PLATFORMIO_SETTING_ENABLE_TELEMETRY=false \
+              --mount "type=volume,source=${workspace_volume},target=${ESPHOME_CONFIG_MOUNT}" \
+              "${image}" \
+              -s firmware_version "${TEST_VERSION}" \
+              compile "${ESPHOME_CONFIG_MOUNT}/builds/${config_file}")
+
+            cleanup_container() {
+              docker rm -f "${container}" >/dev/null 2>&1 || true
+            }
+            trap cleanup_container RETURN
+
+            set +e
+            docker start -a "${container}" 2>&1 | tee "${log_file}"
+            local status=${PIPESTATUS[0]}
+            set -e
+            if [ "${status}" -ne 0 ]; then
+              return "${status}"
+            fi
+
+            local container_build_dir="${ESPHOME_CONFIG_MOUNT}/${RELEASE_ESPHOME_CACHE_DIR}/build/${{ matrix.build_name }}/build"
+            if ! docker cp "${container}:${container_build_dir}/${binary_name}" "${output_binary}"; then
+              echo "::error::Firmware compilation failed - ${binary_name} not found"
+              return 1
+            fi
+
+          }
+
+          compile_in_isolated_container \
+            "${{ matrix.yaml }}.factory.yaml" factory firmware.factory.bin
+          python3 scripts/check_build_budgets.py \
+            --compile-log "output/${{ matrix.slug }}.factory.log" \
+            --profile factory \
+            --binary "output/${{ matrix.slug }}.factory.bin"
+
+          compile_in_isolated_container \
+            "${{ matrix.yaml }}.yaml" ota firmware.ota.bin
+          python3 scripts/check_build_budgets.py \
+            --compile-log "output/${{ matrix.slug }}.ota.log" \
+            --profile ota \
+            --binary "output/${{ matrix.slug }}.ota.bin"
+
+          staging_container=$(docker create \
+            --mount "type=volume,source=${workspace_volume},target=${ESPHOME_CONFIG_MOUNT}" \
+            --entrypoint /bin/true \
+            "${image}")
+          docker cp "${staging_container}:${ESPHOME_CONFIG_MOUNT}/${RELEASE_ESPHOME_CACHE_DIR}/." \
+            "${RELEASE_ESPHOME_CACHE_DIR}"
+          docker rm "${staging_container}" >/dev/null
+          staging_container=""
+
+          {
+            echo "version=${TEST_VERSION}"
+            echo "source_ref=${GITHUB_REF_NAME}"
+            echo "source_sha=${GITHUB_SHA}"
+          } > "output/${{ matrix.slug }}.version.txt"
+
+      - name: Fix ESPHome cache permissions
+        if: always()
+        run: |
+          if [ -d "${RELEASE_ESPHOME_CACHE_DIR}" ]; then
+            chmod -R u+rwX "${RELEASE_ESPHOME_CACHE_DIR}"
+          fi
+
+      - name: Upload test firmware artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: firmware-test-${{ matrix.slug }}
+          path: output/

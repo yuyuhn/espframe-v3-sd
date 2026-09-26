@@ -1,0 +1,485 @@
+"use strict";
+
+import { SettingSaveCoordinator } from "./setting_save";
+import { EspframeApiClient, EspframeApiError, type LegacySettingWrite } from "./api_client";
+
+import {
+  MAX_PHOTO_ID_FIELD_LENGTH, extractUrlHost, extractUrlPort, isValidHttpUrl,
+  normalizeImmichUrl, normalizeNtpServer, normalizeDateTakenFormat,
+  parsePhotoLabelList, photoIdFieldTooLong, photoLabelFieldTooLong,
+  splitPhotoIdList, isValidUuidList
+} from "./compat";
+
+  __ESPFRAME_WEB_CONTRACTS__
+
+  type AppState = Partial<__ESPFRAME_SETTING_STATE_TYPES__> & RuntimeState;
+
+  var TIMEZONES = __ESPFRAME_TIMEZONES__;
+  var TIMEZONE_LABELS = __ESPFRAME_TIMEZONE_LABELS__;
+  var PRODUCT_SETTINGS: Record<string, ProductSetting> = __ESPFRAME_PRODUCT_SETTINGS__;
+  var STATIC_ENTITIES = __ESPFRAME_STATIC_ENTITIES__;
+  var MANUAL_ENTITIES = __ESPFRAME_MANUAL_ENTITIES__;
+  var MANUAL_STATE_KEYS = __ESPFRAME_MANUAL_STATE_KEYS__;
+  var ENTITY_ALIASES = __ESPFRAME_ENTITY_ALIASES__;
+  var BACKUP_CONFIG_VERSION = __ESPFRAME_BACKUP_CONFIG_VERSION__;
+  var BACKUP_SCHEMA = __ESPFRAME_BACKUP_SCHEMA__;
+  var LIVE_RENDER_STATE_KEYS = __ESPFRAME_LIVE_RENDER_STATE_KEYS__;
+  var LIVE_RENDER_STATE_PREFIXES = __ESPFRAME_LIVE_RENDER_STATE_PREFIXES__;
+  var FIRMWARE_MANIFEST_URLS = __ESPFRAME_FIRMWARE_MANIFEST_URLS__;
+  var FIRMWARE_DEVICE_SLUG = __ESPFRAME_FIRMWARE_DEVICE_SLUG__;
+  var DOCS_BASE_URL = __ESPFRAME_DOCS_BASE_URL__;
+  var WEB_UI_TABS = __ESPFRAME_WEB_UI_TABS__;
+  var WEB_UI_CARDS = __ESPFRAME_WEB_UI_CARDS__;
+  var WEB_UI_LOGS_RETAINED_LINES = __ESPFRAME_WEB_UI_LOGS_RETAINED_LINES__;
+  var SUPPORT_URL = __ESPFRAME_SUPPORT_URL__;
+  var SUPPORT_BUTTON_IMAGE_DATA_URI = __ESPFRAME_SUPPORT_BUTTON_IMAGE_DATA_URI__;
+  var GENERATED_CONFIGURATION_CAPABILITIES: ConfigurationCapabilities = __ESPFRAME_CONFIGURATION_API_CONTRACT__;
+
+  var S: AppState = {
+    tz_options: TIMEZONES,
+    tz_labels: TIMEZONE_LABELS,
+    brightness: 100,
+    backlight_on: true,
+    immich_url: "",
+    api_key_configured: false,
+    firmware: "",
+    installed_version: "",
+    latest_version: "",
+    update_available: false,
+    firmware_version_options: [],
+    firmware_versions_loaded: false,
+    firmware_versions_loading: false,
+    firmware_metadata_loading: false,
+    firmware_selected_version: "",
+    firmware_checking: false,
+    firmware_installing: false,
+    firmware_uploading: false,
+    firmware_restart_pending: false,
+    firmware_install_error: "",
+    c6_firmware_checking: false,
+    c6_firmware_installing: false,
+    brightness_current: 0,
+    sunrise: "",
+    sunset: "",
+    album_ids: "",
+    album_labels: "",
+    person_ids: "",
+    person_labels: "",
+    tag_ids: "",
+    tag_labels: "",
+    developer_features_enabled: false,
+  };
+
+  function registerStaticEntityStateDefaults() {
+    if (!STATIC_ENTITIES) return;
+    Object.keys(STATIC_ENTITIES).forEach(function (key) {
+      var spec = STATIC_ENTITIES[key];
+      if (!spec || spec.default === undefined) return;
+      if (S[key] === undefined) S[key] = spec.default;
+    });
+  }
+
+  function registerProductSettingStateDefaults() {
+    if (!PRODUCT_SETTINGS) return;
+    Object.keys(PRODUCT_SETTINGS).forEach(function (key) {
+      var spec = PRODUCT_SETTINGS[key];
+      if (!spec) return;
+      if (S[key] === undefined) S[key] = spec.default !== undefined ? spec.default : "";
+    });
+  }
+
+  registerStaticEntityStateDefaults();
+  registerProductSettingStateDefaults();
+
+  function productNumberSettingField(key, field, fallback) {
+    var spec = PRODUCT_SETTINGS && PRODUCT_SETTINGS[key];
+    var value = spec && spec[field] !== undefined ? Number(spec[field]) : NaN;
+    return isFinite(value) ? value : fallback;
+  }
+
+  function productNumberMin(key, fallback) {
+    return productNumberSettingField(key, "min", fallback);
+  }
+
+  function productNumberMax(key, fallback) {
+    return productNumberSettingField(key, "max", fallback);
+  }
+
+  function productNumberStep(key, fallback) {
+    return productNumberSettingField(key, "step", fallback);
+  }
+
+  function productTextMaxLength(key, fallback) {
+    var spec = PRODUCT_SETTINGS && PRODUCT_SETTINGS[key];
+    var value = spec && spec.maxLength !== undefined ? Number(spec.maxLength) : NaN;
+    return isFinite(value) && value > 0 ? value : fallback;
+  }
+
+  function productSettingOptions(key, includeDeveloper?) {
+    var spec = PRODUCT_SETTINGS && PRODUCT_SETTINGS[key];
+    var options = spec && Array.isArray(spec.options) ? spec.options.slice() : [];
+    if (includeDeveloper && spec && Array.isArray(spec.developerOptions)) {
+      spec.developerOptions.forEach(function (option) {
+        if (options.indexOf(option) === -1) options.push(option);
+      });
+    }
+    return options;
+  }
+
+  var CSS = __ESPFRAME_CSS__;
+  var FAVICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" id="mdi-home-automation" viewBox="0 0 24 24"><path fill="#5c73e7" d="M12,3L2,12H5V20H19V12H22L12,3M12,8.5C14.34,8.5 16.46,9.43 18,10.94L16.8,12.12C15.58,10.91 13.88,10.17 12,10.17C10.12,10.17 8.42,10.91 7.2,12.12L6,10.94C7.54,9.43 9.66,8.5 12,8.5M12,11.83C13.4,11.83 14.67,12.39 15.6,13.3L14.4,14.47C13.79,13.87 12.94,13.5 12,13.5C11.06,13.5 10.21,13.87 9.6,14.47L8.4,13.3C9.33,12.39 10.6,11.83 12,11.83M12,15.17C12.94,15.17 13.7,15.91 13.7,16.83C13.7,17.75 12.94,18.5 12,18.5C11.06,18.5 10.3,17.75 10.3,16.83C10.3,15.91 11.06,15.17 12,15.17Z"/></svg>';
+
+  var style = document.createElement("style");
+  style.textContent = CSS;
+  document.head.appendChild(style);
+  ensureFavicon();
+
+  var els: Record<string, any> = {};
+  var app: HTMLElement;
+
+  __ESPFRAME_WEB_APP_SHELL__
+
+  var apiClient = new EspframeApiClient(GENERATED_CONFIGURATION_CAPABILITIES);
+
+  __ESPFRAME_WEB_ENDPOINTS__
+
+  // Matches the ESPHome template text max_length for album/person/tag ID and label lists.
+  var MAX_NTP_SERVER_LENGTH = 253;
+  var PHOTO_ID_FIELD_TOO_LONG =
+    "List exceeds 255 characters (device limit). Remove IDs or shorten the list.";
+  var PHOTO_LABEL_FIELD_TOO_LONG =
+    "Labels exceed 255 characters (device limit). Shorten or remove labels.";
+
+  function postTextValueSet(url, value, useQueryFallback?) {
+    return apiClient.postText(url, value == null ? "" : String(value), useQueryFallback).catch(function (err) {
+      console.error("POST " + url + " error:", err);
+      showBanner("Failed to save setting", "error");
+      throw err;
+    });
+  }
+
+  function delayMs(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  function saveConnectionValue(path, value, useQueryFallback) {
+    // Legacy adapter compatibility: saveConnectionValue(endpoints.immich_url, ...)
+    // and saveConnectionValue(endpoints.api_key, ...) remain the per-entity form.
+    return postTextValueSet(path + "/set", value, useQueryFallback).then(function (r) {
+      if (!r || !r.ok) throw new Error("save_failed");
+      return delayMs(1200);
+    });
+  }
+
+  function connectionResponseValue(resp) {
+    return (resp && (resp.value || resp.state)) || "";
+  }
+
+  function saveAndVerifyConnectionValue(path, value, useQueryFallback, isSaved) {
+    if (path === endpoints.api_key) return saveAndVerifyApiKey(value);
+    return settingSaves.save({ immich_url: value }, function () {
+      return saveConnectionValue(path, value, useQueryFallback)
+        .then(function () {
+          return safeGet(path);
+        })
+        .then(function (resp) {
+          var saved = connectionResponseValue(resp);
+          if (isSaved && !isSaved(saved)) throw Error("verify_failed");
+          return saved;
+        });
+    });
+  }
+
+  function saveAndVerifyApiKey(value) {
+    var apiKey = String(value || "").trim();
+    if (!apiKey) return Promise.reject(Error("missing_api_key"));
+    return settingSaves.save({ api_key_configured: true }, function () {
+      return apiClient.updateSettings({ api_key: apiKey }, [legacySettingWrite("api_key", apiKey)])
+        .then(function () { return delayMs(150); })
+        .then(function () { return getConfigurationSnapshot(); })
+        .then(function (snapshot) {
+          if (!snapshot.api_key_configured) throw Error("verify_failed");
+        })
+        .catch(function (error) {
+          if (!(error instanceof EspframeApiError) || error.kind !== "unavailable") throw error;
+          return safeGet(endpoints.api_key).then(function (resp) {
+            if (!resp || (!resp.api_key_configured && !connectionResponseValue(resp))) {
+              throw Error("verify_failed");
+            }
+          });
+        });
+    });
+  }
+
+  function saveAndVerifyConnection(url, key) {
+    var normalizedUrl = normalizeImmichUrl(url);
+    var apiKey = String(key || "").trim();
+    if (!normalizedUrl || !apiKey) return Promise.reject(new Error("missing_connection"));
+    return settingSaves.save({ immich_url: normalizedUrl, api_key_configured: true }, function () {
+      return apiClient.updateSettings(
+        { immich_url: normalizedUrl, api_key: apiKey },
+        [legacySettingWrite("immich_url", normalizedUrl), legacySettingWrite("api_key", apiKey)]
+      )
+        .then(function () { return delayMs(150); })
+        .then(function () { return getConfigurationSnapshot(); })
+        .catch(function (error) {
+          if (!(error instanceof EspframeApiError) || error.kind !== "unavailable") throw error;
+          return Promise.all([safeGet(endpoints.immich_url), safeGet(endpoints.api_key)]);
+        })
+        .then(function (result) {
+          var savedUrl;
+          if (result && !Array.isArray(result)) {
+            savedUrl = normalizeImmichUrl(result.values.immich_url);
+            if (!result.api_key_configured) throw Error("verify_failed");
+          } else {
+            savedUrl = normalizeImmichUrl(connectionResponseValue(result[0]));
+            if (!connectionResponseValue(result[1])) throw Error("verify_failed");
+          }
+          if (savedUrl !== normalizedUrl) throw Error("verify_failed");
+          return { url: normalizedUrl, key: apiKey };
+        });
+    });
+  }
+
+  var PHOTO_SOURCE_APPLY_SETTING_KEYS = [
+    "photo_source",
+    "album_order",
+    "albums_enabled",
+    "people_enabled",
+    "tags_enabled",
+    "favorites_enabled",
+    "rating_enabled",
+    "location_enabled",
+    "inclusion_matching",
+    "album_matching",
+    "person_matching",
+    "favorite_mode",
+    "minimum_rating",
+    "filter_country",
+    "filter_state",
+    "filter_city",
+    "album_ids",
+    "person_ids",
+    "tag_ids",
+    "excluded_album_ids",
+    "excluded_person_ids",
+    "excluded_tag_ids",
+    "date_filter_enabled",
+    "date_filter_mode",
+    "date_from",
+    "date_to",
+    "relative_amount",
+    "relative_unit"
+  ];
+
+  function settingUsesPhotoSourceApply(key) {
+    return PHOTO_SOURCE_APPLY_SETTING_KEYS.indexOf(key) !== -1;
+  }
+
+  var settingSaves = new SettingSaveCoordinator(
+    function (key) { return S[key]; },
+    function (key, value) { S[key] = value; }
+  );
+
+  Object.keys(S).forEach(function (key) {
+    var value = S[key];
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      settingSaves.receive(key, value);
+    }
+  });
+
+  function legacySettingWrite(key, savedValue): LegacySettingWrite {
+    var domain = settingEntityDomain(key);
+    return { key: key, domain: domain, url: endpoints[key], value: savedValue };
+  }
+
+  function saveSettingValues(values) {
+    return settingSaves.save(values, function () {
+      return apiClient.updateSettings(values, Object.keys(values).map(function (key) {
+        return legacySettingWrite(key, values[key]);
+      }));
+    });
+  }
+
+  function saveGenericSetting(key, value) {
+    if (!key || !endpoints[key]) return Promise.resolve(null);
+    if (key === "api_key") return saveAndVerifyApiKey(value);
+    var domain = settingEntityDomain(key);
+    var savedValue = value;
+    if (domain === "switch") savedValue = !!value;
+    if (domain === "number") {
+      var numberValue = Number(value);
+      if (isFinite(numberValue)) savedValue = numberValue;
+    }
+    if (domain === "select" || domain === "text") savedValue = value == null ? "" : String(value);
+    return saveSettingValues({ [key]: savedValue });
+  }
+
+  function saveNtpServer(key, value) {
+    return saveSettingValues({ [key]: normalizeNtpServer(value) });
+  }
+
+  function saveScheduleWakeTimeoutSetting(key, value) {
+    return saveGenericSetting(key, normalizeScheduleWakeTimeout(value));
+  }
+
+  function saveScreenRotationSetting(key, value) {
+    var rotation = String(value);
+    if (screenRotationOptionsForUi().indexOf(rotation) === -1) return Promise.resolve(null);
+    return saveSettingValues({
+      screen_rotation: rotation,
+      portrait_pairing: !isPortraitScreenRotation(rotation)
+    });
+  }
+
+  function reportSettingSaveFailure() {
+    showBanner("Failed to save setting", "error");
+    renderSettingsAfterEditing();
+  }
+
+  var SETTING_SAVE_ADAPTERS = {
+    ntp_server_1: saveNtpServer,
+    ntp_server_2: saveNtpServer,
+    ntp_server_3: saveNtpServer,
+    schedule_wake_timeout: saveScheduleWakeTimeoutSetting,
+    screen_rotation: saveScreenRotationSetting
+  };
+
+  function saveSetting(key, value, options?) {
+    var opts = options || {};
+    var adapter = SETTING_SAVE_ADAPTERS[key];
+    var result = adapter ? adapter(key, value, opts) : saveGenericSetting(key, value);
+    if (opts.applyPhotoSource && settingUsesPhotoSourceApply(key)) {
+      result = Promise.resolve(result).then(function (saved) {
+        return post(endpoints.apply_photo_source + "/press").then(function () { return saved; });
+      });
+    }
+    // Event handlers may ignore the result; backup import still receives the
+    // original rejecting promise so it can report partial failures accurately.
+    result.catch(reportSettingSaveFailure);
+    return result;
+  }
+
+  function makeConnectionUrlField(value) {
+    var f = field("Immich Server URL");
+    var urlInput = input("url", value, "http://192.168.0.1:2283");
+    f.appendChild(urlInput);
+    return { field: f, input: urlInput };
+  }
+
+  function makeApiKeyInputGroup(options) {
+    var opts = options || {};
+    var grp = el("div", "input-group");
+    var keyInput = input(opts.type || "text", opts.value || "", opts.placeholder || "Your Immich API key");
+    var button = null;
+    grp.appendChild(keyInput);
+    if (opts.toggleVisibility) {
+      button = el("button", "btn btn-secondary");
+      button.textContent = "Show";
+      button.type = "button";
+      button.onclick = function () {
+        var isPass = keyInput.type === "password";
+        keyInput.type = isPass ? "text" : "password";
+        button.textContent = isPass ? "Hide" : "Show";
+      };
+      grp.appendChild(button);
+    } else if (opts.buttonText) {
+      button = el("button", opts.buttonClass || "btn btn-primary");
+      button.textContent = opts.buttonText;
+      button.type = "button";
+      if (opts.onButtonClick) {
+        button.onclick = function () {
+          opts.onButtonClick(keyInput, button);
+        };
+      }
+      grp.appendChild(button);
+    }
+    return { group: grp, input: keyInput, button: button };
+  }
+
+  function makeMaskedApiKeyRow(onChange) {
+    var row = el("div", "input-group");
+    var mask = el("div");
+    var cb = el("button", "btn btn-secondary");
+    mask.className = "key-mask";
+    mask.textContent = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022";
+    cb.textContent = "Change";
+    cb.type = "button";
+    cb.onclick = onChange;
+    row.appendChild(mask);
+    row.appendChild(cb);
+    return row;
+  }
+
+
+  function developerPanelEnabledByUrl() {
+    try {
+      var params = new URLSearchParams(window.location.search || "");
+      return params.get("developer") === "experimental" || params.get("dev") === "experimental";
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function isPortraitScreenRotation(value) {
+    return value === "90" || value === "270";
+  }
+
+  function screenRotationOptionsForUi() {
+    var options = productSettingOptions("screen_rotation", S.developer_features_enabled);
+    return options.length ? options : ["0", "180"];
+  }
+
+  function effectiveScreenRotationForUi() {
+    var current = String(S.screen_rotation || "0");
+    return screenRotationOptionsForUi().indexOf(current) !== -1 ? current : "0";
+  }
+
+  function buildPhotoLabelList(idInputs, labelInputs) {
+    var labels = [];
+    for (var i = 0; i < idInputs.length; i++) {
+      if (idInputs[i].value.trim()) labels.push(labelInputs[i].value.trim());
+    }
+    while (labels.length && !labels[labels.length - 1]) labels.pop();
+    return labels.length ? JSON.stringify(labels) : "";
+  }
+
+  function safeGet(url) {
+    return apiClient.getJson(url)
+      .catch(function () {
+        return null;
+      });
+  }
+
+  function displayVersion(value, fallback) {
+    var v = String(value || "").trim();
+    if (!v) return fallback || "";
+    if (v.toLowerCase() === "dev") return "Dev";
+    return v;
+  }
+
+  // --- SSE-based init ---
+
+  __ESPFRAME_WEB_RUNTIME_STATE__
+
+  __ESPFRAME_WEB_STARTUP_WIZARD__
+
+  __ESPFRAME_WEB_SETTINGS_IMMICH_CARDS__
+
+  __ESPFRAME_WEB_SETTINGS_SCREEN_CARDS__
+
+  __ESPFRAME_WEB_SETTINGS_FIRMWARE_CARD__
+
+  __ESPFRAME_WEB_SETTINGS_CONTROLS__
+
+  __ESPFRAME_WEB_LIVE_HELPERS__
+
+  __ESPFRAME_WEB_FRAME_IDENTITY__
+
+  __ESPFRAME_WEB_BACKUP_IMPORT__
+
+  // --- Init ---
+
+  buildUI();
+  initSSE();
+  loadFrameIdentity();

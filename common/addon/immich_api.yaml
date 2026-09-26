@@ -1,0 +1,1637 @@
+# =============================================================================
+# IMMICH API - Fetch scripts for Immich server integration
+# =============================================================================
+# Compatibility note: Smart Filter V1 replaces build_immich_search_body,
+# pick_album_id_for_metadata_search, pick_one_person_id_for_random_search,
+# build_immich_date_filter_extra, and build_immich_companion_date_filter_extra
+# at request sites with the normalized ImmichFilterConfig serializers.
+# Handles HTTP requests to the Immich API for fetching random images and
+# searching for portrait companions from the same day.
+# =============================================================================
+
+globals:
+  - id: immich_request_state
+    type: ImmichRequestState
+  - id: immich_candidate_pool
+    type: std::vector<ImmichAssetMeta>
+  - id: immich_filter_config
+    type: ImmichFilterConfig
+
+script:
+  - id: immich_register_fetch_failure
+    mode: restart
+    then:
+      - lambda: |-
+          uint32_t cooldown_ms = id(immich_request_state).register_fetch_failure(millis());
+          ESP_LOGW("immich",
+                   "Fetch failure registered; pausing fetches for %us (consecutive failures=%d)",
+                   (unsigned) (cooldown_ms / 1000), id(immich_request_state).consecutive_failures);
+
+  - id: immich_register_fetch_success
+    mode: restart
+    then:
+      - lambda: |-
+          id(immich_fetch_started) = true;
+          id(immich_request_state).register_success();
+          id(immich_request_state).empty_branch_attempts = 0;
+          id(immich_request_state).empty_id_attempts = 0;
+
+  - id: immich_try_next_filter_branch
+    mode: restart
+    then:
+      - delay: 100ms
+      - script.execute: immich_fetch_into_slot
+
+  # ---------------------------------------------------------------------------
+  # Display fallback when companion portrait search fails or finds nothing
+  # ---------------------------------------------------------------------------
+  - id: handle_companion_not_found
+    mode: single
+    then:
+      - lambda: |-
+          id(espframe_core).slideshow().handle_companion_not_found(
+            id(espframe_core).slideshow().state().portrait, id(espframe_core).slideshow().state().portrait_companion_url, id(espframe_core).slideshow().state().companion_target_slot,
+            id(espframe_core).slideshow().state().active_slot, id(espframe_core).slideshow().state().slot0, id(espframe_core).slideshow().state().slot1, id(espframe_core).slideshow().state().slot2,
+            id(espframe_core).slideshow().state().active_slot_displayed, id(portrait_pairs_only).state);
+          id(espframe_slideshow_dispatch).execute();
+
+  # ---------------------------------------------------------------------------
+  # Fetch memories ("on this day") — step 1: collect assets from the configured
+  # calendar-day window around today.
+  # ---------------------------------------------------------------------------
+  - id: immich_fetch_memory_into_slot
+    mode: single
+    then:
+      - if:
+          condition:
+            not:
+              wifi.connected:
+          then:
+            - logger.log:
+                level: DEBUG
+                tag: immich
+                format: "Skipping memories fetch (wifi disconnected)"
+            - script.stop: immich_fetch_memory_into_slot
+      - if:
+          condition:
+            lambda: 'return id(immich_url).state.empty() || id(immich_api_key_value).empty();'
+          then:
+            - script.stop: immich_fetch_memory_into_slot
+      - lambda: |-
+          id(immich_request_state).begin_memory_search(
+            immich_memories_window_days(id(immich_memories_window).current_option()));
+      - script.execute:
+          id: immich_fetch_memory_window_day
+          request_generation: !lambda 'return id(immich_request_state).memory_request_generation;'
+
+  - id: immich_memory_fallback_or_empty
+    mode: restart
+    parameters:
+      request_generation: uint32_t
+    then:
+      - if:
+          condition:
+            lambda: 'return id(immich_request_state).memory_request_is_current(request_generation);'
+          then:
+            - lambda: |-
+                clear_slot_fetch_in_flight(
+                  id(espframe_core).slideshow().state().target_slot,
+                  id(espframe_core).slideshow().state().slot_flags);
+            - if:
+                condition:
+                  lambda: 'return id(immich_memories_fallback).state;'
+                then:
+                  - lambda: 'id(immich_request_state).memory_fallback = true;'
+                  - script.execute: immich_fetch_into_slot
+                else:
+                  - lambda: |-
+                      ESP_LOGD("immich", "No memory images; retrying in 30 seconds");
+                      id(immich_request_state).reset_retries_and_pause(millis());
+                  - script.execute:
+                      id: show_photo_source_empty_state
+                      memories_source: true
+
+  - id: immich_memory_request_failed
+    mode: restart
+    parameters:
+      request_generation: uint32_t
+    then:
+      - if:
+          condition:
+            lambda: 'return id(immich_request_state).memory_request_is_current(request_generation);'
+          then:
+            - lambda: |-
+                clear_slot_fetch_in_flight(
+                  id(espframe_core).slideshow().state().target_slot,
+                  id(espframe_core).slideshow().state().slot_flags);
+            - if:
+                condition:
+                  lambda: 'return id(immich_memories_fallback).state;'
+                then:
+                  - lambda: 'id(immich_request_state).memory_fallback = true;'
+                  - script.execute: immich_fetch_into_slot
+                else:
+                  - lambda: |-
+                      id(immich_request_state).register_request_error();
+                      ESP_LOGW("immich", "Transient Memories request failure (attempt %d)",
+                               id(immich_request_state).api_retries);
+                  - if:
+                      condition:
+                        lambda: 'return id(immich_request_state).retry_available(MAX_ERROR_RETRIES);'
+                      then:
+                        - script.execute: immich_fetch_retry
+                      else:
+                        - script.execute: immich_register_fetch_failure
+                        - script.execute:
+                            id: show_photo_source_empty_state
+                            memories_source: true
+
+  - id: immich_fetch_memory_window_day
+    mode: queued
+    parameters:
+      request_generation: uint32_t
+    then:
+      - if:
+          condition:
+            lambda: 'return id(immich_request_state).memory_request_is_current(request_generation) && !id(sntp_time).now().is_valid();'
+          then:
+            - lambda: |-
+                id(immich_request_state).memory_waiting_for_time = true;
+                clear_slot_fetch_in_flight(
+                  id(espframe_core).slideshow().state().target_slot,
+                  id(espframe_core).slideshow().state().slot_flags);
+            - logger.log:
+                level: DEBUG
+                tag: immich
+                format: "Waiting for valid time before Memories request"
+            - script.stop: immich_fetch_memory_window_day
+      - if:
+          condition:
+            lambda: 'return !id(immich_request_state).memory_request_is_current(request_generation);'
+          then:
+            - script.stop: immich_fetch_memory_window_day
+      - lambda: 'id(immich_request_state).memory_waiting_for_time = false;'
+      - lambda: 'id(immich_request_state).memory_asset_loaded = false;'
+      - http_request.get:
+          id: http_req
+          url: !lambda |-
+            auto now = id(sntp_time).now();
+            std::string day = immich_format_iso_date_offset(
+              now.year, now.month, now.day_of_month,
+              id(immich_request_state).memory_window_offset);
+            return id(immich_url).state + "/api/memories?type=on_this_day&for=" + day;
+          # Deliberately no capture_response: an on_this_day response can reach
+          # tens or hundreds of kB depending on how many memories the library
+          # holds for that day, and capture_response copies the whole body into a
+          # std::string, which allocates from internal DRAM. The body is streamed
+          # into the filtered parser below instead. See on_response.
+          request_headers:
+            Accept: application/json
+            x-api-key: !lambda 'return id(immich_api_key_value).c_str();'
+          on_response:
+            then:
+              - lambda: |-
+                  if (!id(immich_request_state).memory_request_is_current(request_generation)) {
+                    ESP_LOGD("immich", "Discarding stale Memories response");
+                    return;
+                  }
+                  id(espframe_core).record_memory("immich-response");
+                  if (response->status_code != 200) {
+                    ESP_LOGW("immich", "Memories HTTP %d for offset %+d", response->status_code,
+                             id(immich_request_state).memory_window_offset);
+                    id(immich_request_state).memory_request_failed = true;
+                    return;
+                  }
+
+                  // Pulls the response straight off the HTTP container in 512B
+                  // chunks so the body is never held in memory in full. The small
+                  // parser below visits each memory asset as it arrives and keeps
+                  // only the reservoir sample in ImmichRequestState. This avoids
+                  // both capture_response and a filtered ArduinoJson document
+                  // proportional to the response. HttpContainer::read() does not
+                  // have BSD socket semantics (0 means "nothing yet" OR "all read",
+                  // <0 is an error), so completion goes through
+                  // http_read_loop_result.
+                  struct MemoriesStreamReader {
+                    esphome::http_request::HttpContainer *container;
+                    uint32_t last_data_time;
+                    uint32_t read_timeout;
+                    uint8_t buf[512];
+                    size_t buf_len{0};
+                    size_t buf_pos{0};
+                    bool eof{false};
+
+                    bool fill() {
+                      if (this->buf_pos < this->buf_len) return true;
+                      if (this->eof) return false;
+                      this->buf_pos = 0;
+                      this->buf_len = 0;
+                      while (true) {
+                        int r = this->container->read(this->buf, sizeof(this->buf));
+                        esphome::App.feed_wdt();
+                        esphome::yield();
+                        auto res = esphome::http_request::http_read_loop_result(
+                          r, this->last_data_time, this->read_timeout,
+                          this->container->is_read_complete());
+                        if (res == esphome::http_request::HttpReadLoopResult::RETRY) continue;
+                        if (res != esphome::http_request::HttpReadLoopResult::DATA) {
+                          this->eof = true;
+                          return false;
+                        }
+                        this->buf_len = (size_t) r;
+                        return true;
+                      }
+                    }
+
+                    int read() {
+                      if (!this->fill()) return -1;
+                      return this->buf[this->buf_pos++];
+                    }
+                  };
+
+                  struct MemoriesJsonParser {
+                    MemoriesStreamReader *reader;
+                    ImmichRequestState *state;
+                    std::string orientation_filter;
+                    int pending = -1;
+
+                    int read() {
+                      if (this->pending >= 0) {
+                        int value = this->pending;
+                        this->pending = -1;
+                        return value;
+                      }
+                      return this->reader->read();
+                    }
+
+                    void unread(int value) {
+                      this->pending = value;
+                    }
+
+                    int next_non_whitespace() {
+                      int value;
+                      do {
+                        value = this->read();
+                      } while (value >= 0 && value <= ' ');
+                      return value;
+                    }
+
+                    bool expect(char expected) {
+                      return this->next_non_whitespace() == expected;
+                    }
+
+                    bool read_string_after_open(std::string *value) {
+                      if (value != nullptr) value->clear();
+                      while (true) {
+                        int ch = this->read();
+                        if (ch < 0) return false;
+                        if (ch == '"') return true;
+                        if (ch != '\\') {
+                          if (value != nullptr) value->push_back(static_cast<char>(ch));
+                          continue;
+                        }
+                        int escaped = this->read();
+                        if (escaped < 0) return false;
+                        if (escaped == 'u') {
+                          for (int i = 0; i < 4; i++) {
+                            if (this->read() < 0) return false;
+                          }
+                          if (value != nullptr) value->push_back('?');
+                          continue;
+                        }
+                        if (value == nullptr) continue;
+                        switch (escaped) {
+                          case 'b': value->push_back('\b'); break;
+                          case 'f': value->push_back('\f'); break;
+                          case 'n': value->push_back('\n'); break;
+                          case 'r': value->push_back('\r'); break;
+                          case 't': value->push_back('\t'); break;
+                          default: value->push_back(static_cast<char>(escaped)); break;
+                        }
+                      }
+                    }
+
+                    bool read_key(std::string *key) {
+                      if (this->next_non_whitespace() != '"') return false;
+                      return this->read_string_after_open(key);
+                    }
+
+                    bool skip_value_from(int first) {
+                      if (first < 0) return false;
+                      if (first == '"') return this->read_string_after_open(nullptr);
+                      if (first == '{') return this->skip_object();
+                      if (first == '[') return this->skip_array();
+                      while (true) {
+                        int ch = this->read();
+                        if (ch < 0) return true;
+                        if (ch == ',' || ch == ']' || ch == '}') {
+                          this->unread(ch);
+                          return true;
+                        }
+                      }
+                    }
+
+                    bool skip_value() {
+                      return this->skip_value_from(this->next_non_whitespace());
+                    }
+
+                    bool skip_object() {
+                      int ch = this->next_non_whitespace();
+                      if (ch == '}') return true;
+                      this->unread(ch);
+                      while (true) {
+                        if (!this->read_key(nullptr) || !this->expect(':') || !this->skip_value()) {
+                          return false;
+                        }
+                        ch = this->next_non_whitespace();
+                        if (ch == '}') return true;
+                        if (ch != ',') return false;
+                      }
+                    }
+
+                    bool skip_array() {
+                      int ch = this->next_non_whitespace();
+                      if (ch == ']') return true;
+                      this->unread(ch);
+                      while (true) {
+                        if (!this->skip_value()) return false;
+                        ch = this->next_non_whitespace();
+                        if (ch == ']') return true;
+                        if (ch != ',') return false;
+                      }
+                    }
+
+                    bool read_integer_from(int first, int *value) {
+                      if (first < 0) return false;
+                      if (first != '-' && (first < '0' || first > '9')) {
+                        return this->skip_value_from(first);
+                      }
+                      std::string raw(1, static_cast<char>(first));
+                      while (true) {
+                        int ch = this->read();
+                        if (ch < 0) break;
+                        if (ch == ',' || ch == ']' || ch == '}') {
+                          this->unread(ch);
+                          break;
+                        }
+                        if (ch <= ' ') continue;
+                        if (ch < '0' || ch > '9') return false;
+                        raw.push_back(static_cast<char>(ch));
+                      }
+                      if (value != nullptr) *value = atoi(raw.c_str());
+                      return true;
+                    }
+
+                    bool parse_exif_info(int first, int *width, int *height,
+                                         std::string *orientation) {
+                      if (first != '{') return this->skip_value_from(first);
+                      std::string key;
+                      int ch = this->next_non_whitespace();
+                      if (ch == '}') return true;
+                      this->unread(ch);
+                      while (true) {
+                        if (!this->read_key(&key) || !this->expect(':')) return false;
+                        ch = this->next_non_whitespace();
+                        if (key == "exifImageWidth" || key == "exifImageHeight") {
+                          int parsed = 0;
+                          if (!this->read_integer_from(ch, &parsed)) return false;
+                          if (key == "exifImageWidth") {
+                            if (width != nullptr) *width = parsed;
+                          } else if (height != nullptr) {
+                            *height = parsed;
+                          }
+                        } else if (key == "orientation" && ch == '"') {
+                          if (!this->read_string_after_open(orientation)) return false;
+                        } else if (!this->skip_value_from(ch)) {
+                          return false;
+                        }
+                        ch = this->next_non_whitespace();
+                        if (ch == '}') return true;
+                        if (ch != ',') return false;
+                      }
+                    }
+
+                    bool parse_asset_object() {
+                      std::string key;
+                      std::string asset_id;
+                      std::string asset_type;
+                      std::string orientation;
+                      int width = 0;
+                      int height = 0;
+                      int exif_width = 0;
+                      int exif_height = 0;
+                      int ch = this->next_non_whitespace();
+                      if (ch == '}') return true;
+                      this->unread(ch);
+                      while (true) {
+                        if (!this->read_key(&key) || !this->expect(':')) return false;
+                        if (key == "id" || key == "type") {
+                          ch = this->next_non_whitespace();
+                          if (ch == '"') {
+                            if (!this->read_string_after_open(
+                                  key == "id" ? &asset_id : &asset_type)) return false;
+                          } else if (!this->skip_value_from(ch)) {
+                            return false;
+                          }
+                        } else if (key == "width" || key == "height") {
+                          ch = this->next_non_whitespace();
+                          int parsed = 0;
+                          if (!this->read_integer_from(ch, &parsed)) return false;
+                          if (key == "width") width = parsed;
+                          else height = parsed;
+                        } else if (key == "exifInfo") {
+                          ch = this->next_non_whitespace();
+                          if (!this->parse_exif_info(ch, &exif_width, &exif_height, &orientation)) {
+                            return false;
+                          }
+                        } else if (!this->skip_value()) {
+                          return false;
+                        }
+                        ch = this->next_non_whitespace();
+                        if (ch == '}') break;
+                        if (ch != ',') return false;
+                      }
+                      if (!asset_id.empty() && (asset_type.empty() || asset_type == "IMAGE")) {
+                        const bool has_raw_exif_dimensions = exif_width > 0 && exif_height > 0;
+                        if (has_raw_exif_dimensions) {
+                          width = exif_width;
+                          height = exif_height;
+                        }
+                        const bool orientation_matches = immich_memory_asset_matches_orientation(
+                            width, height, orientation, has_raw_exif_dimensions,
+                            this->orientation_filter);
+                        this->state->add_memory_image(asset_id, orientation_matches);
+                      }
+                      return true;
+                    }
+
+                    bool parse_assets_array() {
+                      int ch = this->next_non_whitespace();
+                      if (ch == ']') return true;
+                      this->unread(ch);
+                      while (true) {
+                        ch = this->next_non_whitespace();
+                        if (ch == '{') {
+                          if (!this->parse_asset_object()) return false;
+                        } else if (!this->skip_value_from(ch)) {
+                          return false;
+                        }
+                        ch = this->next_non_whitespace();
+                        if (ch == ']') return true;
+                        if (ch != ',') return false;
+                      }
+                    }
+
+                    bool parse_memory_object() {
+                      std::string key;
+                      int ch = this->next_non_whitespace();
+                      if (ch == '}') return true;
+                      this->unread(ch);
+                      while (true) {
+                        if (!this->read_key(&key) || !this->expect(':')) return false;
+                        if (key == "assets") {
+                          ch = this->next_non_whitespace();
+                          if (ch != '[' || !this->parse_assets_array()) return false;
+                        } else if (!this->skip_value()) {
+                          return false;
+                        }
+                        ch = this->next_non_whitespace();
+                        if (ch == '}') return true;
+                        if (ch != ',') return false;
+                      }
+                    }
+
+                    bool parse() {
+                      if (!this->expect('[')) return false;
+                      int ch = this->next_non_whitespace();
+                      if (ch == ']') return true;
+                      this->unread(ch);
+                      while (true) {
+                        ch = this->next_non_whitespace();
+                        if (ch == '{') {
+                          if (!this->parse_memory_object()) return false;
+                        } else if (!this->skip_value_from(ch)) {
+                          return false;
+                        }
+                        ch = this->next_non_whitespace();
+                        if (ch == ']') return true;
+                        if (ch != ',') return false;
+                      }
+                    }
+                  };
+
+                  MemoriesStreamReader reader;
+                  reader.container = response.get();
+                  reader.last_data_time = millis();
+                  reader.read_timeout = id(http_req)->get_timeout();
+                  MemoriesJsonParser parser{
+                    &reader, &id(immich_request_state),
+                    id(photo_orientation_filter).current_option()};
+                  if (!parser.parse()) {
+                    ESP_LOGD("immich", "No memories for offset %+d", id(immich_request_state).memory_window_offset);
+                    return;
+                  }
+              - if:
+                  condition:
+                    lambda: 'return id(immich_request_state).memory_request_is_current(request_generation);'
+                  then:
+                    - lambda: |-
+                        if (id(immich_request_state).memory_request_failed) {
+                          id(immich_memory_request_failed).execute(request_generation);
+                          return;
+                        }
+                        if (id(immich_request_state).advance_memory_window()) {
+                          id(immich_fetch_memory_window_day).execute(request_generation);
+                          return;
+                        }
+
+                        if (id(immich_request_state).memory_image_count <= 0) {
+                          ESP_LOGD("immich", "No memory images in configured window");
+                          id(immich_memory_fallback_or_empty).execute(request_generation);
+                          return;
+                        }
+
+                        // memory_asset_id already holds the sampled pick.
+                        ESP_LOGD("immich", "Memory picked: %s (1 of %d in configured window)",
+                                 id(immich_request_state).memory_asset_id.c_str(), id(immich_request_state).memory_image_count);
+                        id(immich_fetch_memory_asset).execute(request_generation);
+          on_error:
+            then:
+              - lambda: |-
+                  if (!id(immich_request_state).memory_request_is_current(request_generation)) {
+                    ESP_LOGD("immich", "Discarding stale Memories request error");
+                    return;
+                  }
+                  ESP_LOGW("immich", "Memories request failed for offset %+d", id(immich_request_state).memory_window_offset);
+                  id(immich_request_state).memory_request_failed = true;
+                  id(immich_memory_request_failed).execute(request_generation);
+
+  # ---------------------------------------------------------------------------
+  # Fetch full asset details for a memory photo — step 2
+  # ---------------------------------------------------------------------------
+  - id: immich_fetch_memory_asset
+    mode: single
+    parameters:
+      request_generation: uint32_t
+    then:
+      - if:
+          condition:
+            not:
+              wifi.connected:
+          then:
+            - logger.log:
+                level: DEBUG
+                tag: immich
+                format: "Skipping memory asset fetch (wifi disconnected)"
+            - script.stop: immich_fetch_memory_asset
+      - delay: 200ms
+      - http_request.get:
+          id: http_req
+          url: !lambda 'return id(immich_url).state + "/api/assets/" + id(immich_request_state).memory_asset_id;'
+          capture_response: true
+          max_response_buffer_size: 16kB
+          request_headers:
+            Accept: application/json
+            x-api-key: !lambda 'return id(immich_api_key_value).c_str();'
+          on_response:
+            then:
+              - lambda: |-
+                  if (!id(immich_request_state).memory_request_is_current(request_generation)) {
+                    ESP_LOGD("immich", "Discarding stale memory asset response");
+                    return;
+                  }
+                  id(espframe_core).record_memory("immich-response");
+                  if (response->status_code != 200) {
+                    ESP_LOGW("immich", "Memory asset HTTP %d", response->status_code);
+                    id(immich_memory_request_failed).execute(request_generation);
+                    return;
+                  }
+                  std::string img_url = parse_immich_asset_and_fill_slot(
+                    body, id(immich_url).state, id(espframe_core).slideshow().state().target_slot, id(espframe_core).slideshow().state().slot0, id(espframe_core).slideshow().state().slot1, id(espframe_core).slideshow().state().slot2,
+                    id(photo_orientation_filter).current_option());
+                  if (img_url.empty()) {
+                    ESP_LOGW("immich", "Memory asset parse failed");
+                    if (id(immich_request_state).reject_memory_asset(id(immich_request_state).memory_asset_id)) {
+                      id(immich_request_state).begin_memory_search(
+                        id(immich_request_state).memory_window_radius, false);
+                      id(immich_fetch_memory_window_day).execute(
+                        id(immich_request_state).memory_request_generation);
+                    } else {
+                      id(immich_memory_fallback_or_empty).execute(request_generation);
+                    }
+                    return;
+                  }
+                  id(immich_request_state).memory_asset_loaded = true;
+                  id(immich_register_fetch_success).execute();
+                  int slot = id(espframe_core).slideshow().state().target_slot;
+                  auto &meta = get_slot(slot, id(espframe_core).slideshow().state().slot0, id(espframe_core).slideshow().state().slot1, id(espframe_core).slideshow().state().slot2);
+                  meta.filter_tag_scope_known = true;
+                  id(immich_request_state).clear_filter_scope_request();
+                  ESP_LOGI("immich", "MEMORY slot %d: %s | %s | %s | %s | portrait=%d",
+                           slot, meta.asset_id.c_str(), meta.date.c_str(), meta.person.c_str(), meta.location.c_str(), meta.is_portrait);
+                  id(espframe_core).slideshow().clear_preload_for_slot(
+                    slot, id(espframe_core).slideshow().state().portrait_preload_slot, id(espframe_core).slideshow().state().portrait_preload_left_ready,
+                    id(espframe_core).slideshow().state().portrait_preload_right_ready, id(espframe_core).slideshow().state().preload_noncritical_in_flight,
+                    id(espframe_core).slideshow().state().noncritical_remote_updates_in_flight);
+                  set_slot_image_url(slot, img_url, id(immich_img_0), id(immich_img_1), id(immich_img_2));
+              - if:
+                  condition:
+                    lambda: 'return id(immich_request_state).memory_request_is_current(request_generation) && id(immich_request_state).memory_asset_loaded;'
+                  then:
+                    - lambda: |-
+                        execute_deferred_slot_image_update(
+                          id(espframe_core).slideshow().state().target_slot, id(deferred_slot0_image_update),
+                          id(deferred_slot1_image_update), id(deferred_slot2_image_update));
+          on_error:
+            then:
+              - lambda: |-
+                  if (!id(immich_request_state).memory_request_is_current(request_generation)) {
+                    ESP_LOGD("immich", "Discarding stale memory asset request error");
+                    return;
+                  }
+                  ESP_LOGW("immich", "Memory asset request failed");
+                  id(immich_memory_request_failed).execute(request_generation);
+
+  # ---------------------------------------------------------------------------
+  # Resolve tag membership for structured multi-tag matches before pairing.
+  # ---------------------------------------------------------------------------
+  - id: immich_fetch_asset_tag_scope
+    mode: single
+    then:
+      - if:
+          condition:
+            not:
+              wifi.connected:
+          then:
+            - lambda: |-
+                const int slot = id(immich_request_state).filter_scope_slot;
+                if (slot >= 0 && slot <= 2) {
+                  get_slot(slot, id(espframe_core).slideshow().state().slot0,
+                           id(espframe_core).slideshow().state().slot1,
+                           id(espframe_core).slideshow().state().slot2).filter_tag_scope_known = false;
+                }
+                id(immich_request_state).clear_filter_scope_request();
+            - script.stop: immich_fetch_asset_tag_scope
+      - http_request.get:
+          id: http_req
+          url: !lambda |-
+            return id(immich_url).state + "/api/assets/" +
+              id(immich_request_state).filter_scope_asset_id;
+          capture_response: true
+          max_response_buffer_size: 16kB
+          request_headers:
+            Accept: application/json
+            x-api-key: !lambda 'return id(immich_api_key_value).c_str();'
+          on_response:
+            then:
+              - lambda: |-
+                  if (!id(immich_request_state).filter_scope_request_is_current()) return;
+                  const int slot = id(immich_request_state).filter_scope_slot;
+                  auto &meta = get_slot(slot, id(espframe_core).slideshow().state().slot0,
+                                        id(espframe_core).slideshow().state().slot1,
+                                        id(espframe_core).slideshow().state().slot2);
+                  bool resolved = false;
+                  if (response->status_code == 200) {
+                    meta.filter_tag_ids = immich_asset_filter_scope(
+                      body, meta.asset_id, id(immich_request_state).filter_scope_tag_ids, "tags");
+                    resolved = !meta.filter_tag_ids.empty();
+                  }
+                  meta.filter_tag_scope_known = resolved;
+                  if (!resolved) {
+                    ESP_LOGW("immich", "Could not resolve tag scope for asset %s (HTTP %d)",
+                             meta.asset_id.c_str(), response->status_code);
+                  }
+                  id(immich_request_state).clear_filter_scope_request();
+              - script.execute: deferred_companion_search
+          on_error:
+            then:
+              - lambda: |-
+                  if (!id(immich_request_state).filter_scope_request_is_current()) return;
+                  const int slot = id(immich_request_state).filter_scope_slot;
+                  if (slot >= 0 && slot <= 2) {
+                    get_slot(slot, id(espframe_core).slideshow().state().slot0,
+                             id(espframe_core).slideshow().state().slot1,
+                             id(espframe_core).slideshow().state().slot2).filter_tag_scope_known = false;
+                  }
+                  ESP_LOGW("immich", "Tag scope request failed for asset %s",
+                           id(immich_request_state).filter_scope_asset_id.c_str());
+                  id(immich_request_state).clear_filter_scope_request();
+              - script.execute: deferred_companion_search
+
+  # ---------------------------------------------------------------------------
+  # Fetch an asset from legacy Album sources using authorized paged metadata
+  # search. Album metadata search includes assets contributed by shared-album
+  # members. Legacy Immich uses paged metadata search; structured Immich 3.2+
+  # album sources use the authorized random search path instead, so a random
+  # ordinal never requires walking cursors.
+  #
+  # The count is cached in RAM until the active photo filters change. Metadata
+  # then fetches one random asset page for Any orientation, or a small candidate
+  # page when orientation filtering needs multiple candidates.
+  # ---------------------------------------------------------------------------
+  - id: immich_fetch_metadata_into_slot
+    mode: single
+    then:
+      - if:
+          condition:
+            not:
+              wifi.connected:
+          then:
+            - logger.log:
+                level: DEBUG
+                tag: immich
+                format: "Skipping metadata fetch (wifi disconnected)"
+            - script.stop: immich_fetch_metadata_into_slot
+      - if:
+          condition:
+            lambda: |-
+              return id(immich_url).state.empty() ||
+                     id(immich_api_key_value).empty() ||
+                     !immich_source_has_required_ids(
+                       id(photo_source_select).current_option(),
+                       id(immich_album_ids).state,
+                       id(immich_person_ids).state,
+                       id(immich_tag_ids).state);
+          then:
+            - lambda: |-
+                ESP_LOGW("immich", "Metadata source selected but Immich URL, API key, or source IDs are missing");
+                clear_slot_fetch_in_flight(id(espframe_core).slideshow().state().target_slot, id(espframe_core).slideshow().state().slot_flags);
+            - if:
+                condition:
+                  lambda: 'return !id(espframe_core).slideshow().state().active_slot_displayed;'
+                then:
+                  - script.execute: immich_retry_config_ready
+            - script.stop: immich_fetch_metadata_into_slot
+      - lambda: |-
+          id(immich_request_state).metadata_page = 1;
+          id(immich_request_state).metadata_cursor.clear();
+          id(immich_request_state).metadata_max_page = 1;
+          id(immich_request_state).metadata_empty_page_probes = 0;
+          id(immich_request_state).metadata_page_bound_is_upper = false;
+          id(immich_request_state).metadata_page1_fallback_attempted = false;
+          id(immich_request_state).metadata_page_size =
+            id(photo_orientation_filter).current_option() == "Any" &&
+              id(immich_request_state).api_generation == ImmichApiGeneration::V31_FLAT
+              ? 1 : IMMICH_METADATA_PAGE_SIZE;
+          std::string source = id(immich_request_state).active_filter_branch.group;
+          std::string extra = build_immich_filter_statistics_body(
+            id(immich_filter_config), id(immich_request_state).active_filter_branch,
+            id(immich_request_state).api_generation);
+          id(immich_request_state).metadata_count_cache_key =
+            build_immich_metadata_count_cache_key(
+              source, id(immich_request_state).metadata_album_id,
+              id(immich_request_state).metadata_person_id,
+              id(immich_request_state).metadata_tag_ids, extra);
+          uint32_t cached_total = 0;
+          bool cached_upper_bound = false;
+          id(immich_request_state).metadata_count_cache_hit =
+            id(immich_request_state).find_metadata_count(
+              id(immich_request_state).metadata_count_cache_key,
+              millis(), &cached_total, &cached_upper_bound);
+          if (id(immich_request_state).metadata_count_cache_hit) {
+            initialize_immich_metadata_page_range(
+              id(immich_request_state), cached_total,
+              id(immich_request_state).metadata_page_size, cached_upper_bound);
+            ESP_LOGD("immich", "Reusing cached metadata count (%u assets)",
+                     (unsigned) cached_total);
+          }
+      - if:
+          condition:
+            lambda: 'return id(immich_request_state).metadata_count_cache_hit;'
+          then:
+            - script.execute: immich_fetch_metadata_page
+            - script.stop: immich_fetch_metadata_into_slot
+      - if:
+          condition:
+            lambda: |-
+              return immich_filter_can_use_album_asset_count(
+                id(immich_filter_config), id(immich_request_state).active_filter_branch) &&
+                id(immich_request_state).api_generation == ImmichApiGeneration::V31_FLAT;
+          then:
+            - script.execute: immich_fetch_album_count
+            - script.stop: immich_fetch_metadata_into_slot
+      - script.execute: immich_fetch_statistics_count
+
+  - id: immich_fetch_album_count
+    mode: single
+    then:
+      - http_request.get:
+          id: http_req
+          url: !lambda |-
+            return id(immich_url).state + "/api/albums/" + id(immich_request_state).metadata_album_id +
+              (id(immich_request_state).api_generation == ImmichApiGeneration::V31_FLAT
+                ? "?withoutAssets=true" : "");
+          capture_response: true
+          max_response_buffer_size: 24kB
+          request_headers:
+            Accept: application/json
+            x-api-key: !lambda 'return id(immich_api_key_value).c_str();'
+          on_response:
+            then:
+              - lambda: |-
+                  id(espframe_core).record_memory("immich-response");
+                  if (response->status_code != 200) {
+                    ESP_LOGW("immich", "Album count HTTP %d", response->status_code);
+                    clear_slot_fetch_in_flight(id(espframe_core).slideshow().state().target_slot, id(espframe_core).slideshow().state().slot_flags);
+                    id(immich_request_state).note_http_failure(response->status_code, millis());
+                    id(immich_request_state).register_request_error();
+                    if (id(immich_request_state).retry_available(MAX_ERROR_RETRIES)) {
+                      id(immich_fetch_retry).execute();
+                    } else {
+                      id(immich_request_state).reset_retries_and_pause(millis());
+                      ESP_LOGW("immich", "Album count HTTP retries exhausted; pausing fetches for 30s");
+                    }
+                    return;
+                  }
+                  uint32_t total = 0;
+                  if (!parse_immich_album_asset_count(body, &total)) {
+                    clear_slot_fetch_in_flight(id(espframe_core).slideshow().state().target_slot, id(espframe_core).slideshow().state().slot_flags);
+                    ESP_LOGW("immich", "Album count response did not contain assetCount");
+                    id(espframe_core).slideshow().state().diagnostic_reason = "album count response invalid";
+                    id(log_immich_diag).execute();
+                    id(immich_register_fetch_failure).execute();
+                    return;
+                  }
+                  id(immich_fetch_started) = true;
+                  id(immich_request_state).clear_http_status();
+                  if (total == 0) {
+                    clear_slot_fetch_in_flight(id(espframe_core).slideshow().state().target_slot, id(espframe_core).slideshow().state().slot_flags);
+                    ESP_LOGW("immich", "Album source has no assets");
+                    if (id(immich_request_state).prepare_any_id_retry(id(immich_filter_config))) {
+                      id(immich_try_next_filter_branch).execute();
+                      return;
+                    }
+                    auto groups = immich_enabled_inclusion_groups(id(immich_filter_config));
+                    if (id(immich_filter_config).inclusion_matching == "Match any enabled group" &&
+                        groups.size() > 1 && ++id(immich_request_state).empty_branch_attempts < groups.size()) {
+                      id(immich_try_next_filter_branch).execute();
+                      return;
+                    }
+                    id(immich_request_state).reset_retries_and_pause(millis());
+                    return;
+                  }
+                  initialize_immich_metadata_page_range(
+                    id(immich_request_state), total, id(immich_request_state).metadata_page_size, true);
+                  id(immich_request_state).remember_metadata_count(
+                    id(immich_request_state).metadata_count_cache_key, total, true, millis());
+                  ESP_LOGD("immich", "Album source selected: page %d size %d of %u assets",
+                           id(immich_request_state).metadata_page, id(immich_request_state).metadata_page_size, (unsigned) total);
+                  id(immich_fetch_metadata_page).execute();
+          on_error:
+            then:
+              - lambda: |-
+                  id(immich_request_state).register_request_error();
+                  ESP_LOGW("immich", "Album count request error for slot %d (attempt %d)", id(espframe_core).slideshow().state().target_slot, id(immich_request_state).api_retries);
+                  clear_slot_fetch_in_flight(id(espframe_core).slideshow().state().target_slot, id(espframe_core).slideshow().state().slot_flags);
+                  id(espframe_core).slideshow().state().diagnostic_reason = "album count request error";
+                  id(log_immich_diag).execute();
+              - if:
+                  condition:
+                    lambda: 'return id(immich_request_state).retry_available(MAX_ERROR_RETRIES);'
+                  then:
+                    - script.execute: immich_fetch_retry
+                  else:
+                    - lambda: |-
+                        id(immich_request_state).reset_retries_and_pause(millis());
+                        ESP_LOGW("immich", "Album count retries exhausted; pausing Immich fetches for 30s");
+
+  - id: immich_fetch_statistics_count
+    mode: single
+    then:
+      - http_request.post:
+          id: http_req
+          url: !lambda 'return id(immich_url).state + "/api/search/statistics";'
+          capture_response: true
+          max_response_buffer_size: 2kB
+          request_headers:
+            Content-Type: application/json
+            Accept: application/json
+            x-api-key: !lambda 'return id(immich_api_key_value).c_str();'
+          body: !lambda |-
+            return build_immich_filter_statistics_body(
+              id(immich_filter_config), id(immich_request_state).active_filter_branch,
+              id(immich_request_state).api_generation);
+          on_response:
+            then:
+              - lambda: |-
+                  id(espframe_core).record_memory("immich-response");
+                  if (response->status_code != 200) {
+                    ESP_LOGW("immich", "Statistics count HTTP %d", response->status_code);
+                    clear_slot_fetch_in_flight(id(espframe_core).slideshow().state().target_slot, id(espframe_core).slideshow().state().slot_flags);
+                    id(immich_request_state).note_http_failure(response->status_code, millis());
+                    id(immich_request_state).register_request_error();
+                    if (id(immich_request_state).retry_available(MAX_ERROR_RETRIES)) {
+                      id(immich_fetch_retry).execute();
+                    } else {
+                      id(immich_request_state).reset_retries_and_pause(millis());
+                      ESP_LOGW("immich", "Statistics HTTP retries exhausted; pausing fetches for 30s");
+                    }
+                    return;
+                  }
+                  id(immich_fetch_started) = true;
+                  id(immich_request_state).clear_http_status();
+                  uint32_t total = parse_immich_statistics_total(body);
+                  if (total == 0) {
+                    clear_slot_fetch_in_flight(id(espframe_core).slideshow().state().target_slot, id(espframe_core).slideshow().state().slot_flags);
+                    ESP_LOGW("immich", "Statistics source has no matching images");
+                    if (id(immich_request_state).prepare_any_id_retry(id(immich_filter_config))) {
+                      id(immich_try_next_filter_branch).execute();
+                      return;
+                    }
+                    auto groups = immich_enabled_inclusion_groups(id(immich_filter_config));
+                    if (id(immich_filter_config).inclusion_matching == "Match any enabled group" &&
+                        groups.size() > 1 && ++id(immich_request_state).empty_branch_attempts < groups.size()) {
+                      id(immich_try_next_filter_branch).execute();
+                      return;
+                    }
+                    id(immich_request_state).reset_retries_and_pause(millis());
+                    return;
+                  }
+                  initialize_immich_metadata_page_range(
+                    id(immich_request_state), total, id(immich_request_state).metadata_page_size, false);
+                  id(immich_request_state).remember_metadata_count(
+                    id(immich_request_state).metadata_count_cache_key, total, false, millis());
+                  ESP_LOGD("immich", "Metadata source selected: page %d size %d of %u matching images",
+                           id(immich_request_state).metadata_page, id(immich_request_state).metadata_page_size, (unsigned) total);
+                  id(immich_fetch_metadata_page).execute();
+          on_error:
+            then:
+              - lambda: |-
+                  id(immich_request_state).register_request_error();
+                  ESP_LOGW("immich", "Statistics count request error for slot %d (attempt %d)", id(espframe_core).slideshow().state().target_slot, id(immich_request_state).api_retries);
+                  clear_slot_fetch_in_flight(id(espframe_core).slideshow().state().target_slot, id(espframe_core).slideshow().state().slot_flags);
+                  id(espframe_core).slideshow().state().diagnostic_reason = "statistics count request error";
+                  id(log_immich_diag).execute();
+              - if:
+                  condition:
+                    lambda: 'return id(immich_request_state).retry_available(MAX_ERROR_RETRIES);'
+                  then:
+                    - script.execute: immich_fetch_retry
+                  else:
+                    - lambda: |-
+                        id(immich_request_state).reset_retries_and_pause(millis());
+                        ESP_LOGW("immich", "Metadata retries exhausted; pausing Immich fetches for 30s");
+
+  - id: immich_fetch_metadata_page_probe
+    mode: restart
+    then:
+      - delay: 250ms
+      - lambda: |-
+          mark_slot_fetch_in_flight(id(espframe_core).slideshow().state().target_slot,
+                                    id(espframe_core).slideshow().state().slot_flags, millis());
+      - script.execute: immich_fetch_metadata_page
+
+  - id: immich_fetch_metadata_page
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return !immich_filter_branch_uses_album(id(immich_request_state).active_filter_branch) ||
+                     id(immich_request_state).metadata_page < 1 ||
+                     id(immich_request_state).metadata_page_size < 1;
+          then:
+            - lambda: |-
+                ESP_LOGW("immich", "Metadata page fetch missing source ID or page");
+                clear_slot_fetch_in_flight(id(espframe_core).slideshow().state().target_slot, id(espframe_core).slideshow().state().slot_flags);
+            - script.stop: immich_fetch_metadata_page
+      - http_request.post:
+          id: http_req
+          url: !lambda 'return id(immich_url).state + "/api/search/metadata";'
+          capture_response: true
+          max_response_buffer_size: 24kB
+          request_headers:
+            Content-Type: application/json
+            Accept: application/json
+            x-api-key: !lambda 'return id(immich_api_key_value).c_str();'
+          body: !lambda |-
+            return build_immich_filter_search_body(
+              id(immich_filter_config), id(immich_request_state).active_filter_branch,
+              id(immich_request_state).api_generation,
+              id(immich_request_state).metadata_page_size, true, true,
+              id(immich_request_state).metadata_page,
+              id(immich_request_state).metadata_cursor);
+          on_response:
+            then:
+              - lambda: |-
+                  id(espframe_core).record_memory("immich-response");
+                  if (response->status_code != 200) {
+                    ESP_LOGW("immich", "Metadata page HTTP %d", response->status_code);
+                    clear_slot_fetch_in_flight(id(espframe_core).slideshow().state().target_slot, id(espframe_core).slideshow().state().slot_flags);
+                    id(immich_request_state).note_http_failure(response->status_code, millis());
+                    id(immich_request_state).register_request_error();
+                    if (id(immich_request_state).retry_available(MAX_ERROR_RETRIES)) {
+                      id(immich_fetch_retry).execute();
+                    } else {
+                      id(immich_request_state).reset_retries_and_pause(millis());
+                      ESP_LOGW("immich", "Metadata page HTTP retries exhausted; pausing fetches for 30s");
+                    }
+                    return;
+                  }
+                  std::string orientation = id(photo_orientation_filter).current_option();
+                  size_t metadata_item_count = 0;
+                  bool metadata_response_valid = parse_immich_metadata_item_count(body, &metadata_item_count);
+                  const std::string current_cursor = id(immich_request_state).metadata_cursor;
+                  const std::string next_cursor =
+                    parse_immich_metadata_next_cursor(body);
+                  if (id(immich_request_state).api_generation == ImmichApiGeneration::V32_STRUCTURED &&
+                      id(immich_request_state).metadata_cursor_page <
+                        id(immich_request_state).metadata_page &&
+                      !next_cursor.empty() && next_cursor != current_cursor) {
+                    id(immich_request_state).metadata_cursor = next_cursor;
+                    id(immich_request_state).metadata_cursor_page++;
+                    ESP_LOGD("immich", "Advancing structured metadata cursor to page %u of %u",
+                             (unsigned) id(immich_request_state).metadata_cursor_page,
+                             (unsigned) id(immich_request_state).metadata_page);
+                    id(immich_fetch_metadata_page_probe).execute();
+                    return;
+                  }
+                  std::string img_url = parse_immich_metadata_asset_and_fill_slot(
+                    body, id(immich_url).state, id(espframe_core).slideshow().state().target_slot, id(espframe_core).slideshow().state().slot0, id(espframe_core).slideshow().state().slot1, id(espframe_core).slideshow().state().slot2,
+                    orientation);
+                  if (img_url.empty()) {
+                    if (!metadata_response_valid) {
+                      clear_slot_fetch_in_flight(id(espframe_core).slideshow().state().target_slot, id(espframe_core).slideshow().state().slot_flags);
+                      ESP_LOGW("immich", "Metadata page response had an unknown shape");
+                      id(espframe_core).slideshow().state().diagnostic_reason = "metadata page response invalid";
+                      id(log_immich_diag).execute();
+                      id(immich_register_fetch_failure).execute();
+                      return;
+                    }
+                    if (id(immich_request_state).api_generation == ImmichApiGeneration::V32_STRUCTURED &&
+                        !next_cursor.empty() && next_cursor != current_cursor) {
+                      id(immich_request_state).metadata_cursor = next_cursor;
+                      ESP_LOGD("immich", "No matching asset on structured metadata cursor; continuing");
+                      id(immich_fetch_metadata_page_probe).execute();
+                      return;
+                    }
+                    if (metadata_item_count == 0 &&
+                        retry_empty_immich_metadata_page(id(immich_request_state))) {
+                      ESP_LOGD("immich", "Empty album metadata page; retrying page %d of %u (probe %u/%u)",
+                               id(immich_request_state).metadata_page,
+                               (unsigned) id(immich_request_state).metadata_max_page,
+                               (unsigned) id(immich_request_state).metadata_empty_page_probes,
+                               (unsigned) MAX_EMPTY_METADATA_PAGE_PROBES);
+                      id(immich_fetch_metadata_page_probe).execute();
+                      return;
+                    }
+                    clear_slot_fetch_in_flight(id(espframe_core).slideshow().state().target_slot, id(espframe_core).slideshow().state().slot_flags);
+                    if (metadata_item_count == 0 &&
+                        id(immich_request_state).prepare_any_id_retry(id(immich_filter_config))) {
+                      id(immich_try_next_filter_branch).execute();
+                      return;
+                    }
+                    auto groups = immich_enabled_inclusion_groups(id(immich_filter_config));
+                    if (metadata_item_count == 0 &&
+                        id(immich_filter_config).inclusion_matching == "Match any enabled group" &&
+                        groups.size() > 1 && ++id(immich_request_state).empty_branch_attempts < groups.size()) {
+                      ESP_LOGD("immich", "Empty album branch; trying the next enabled group");
+                      id(immich_try_next_filter_branch).execute();
+                      return;
+                    }
+                    if (metadata_item_count > 0 && orientation != "Any" && id(immich_request_state).retry_available(MAX_ERROR_RETRIES)) {
+                      id(immich_request_state).register_request_error();
+                      ESP_LOGW("immich", "No %s image in metadata page; retrying", orientation.c_str());
+                      id(immich_fetch_retry).execute();
+                      return;
+                    }
+                    ESP_LOGW("immich", "Metadata page asset parse failed");
+                    id(espframe_core).slideshow().state().diagnostic_reason = "metadata page asset parse failed";
+                    id(log_immich_diag).execute();
+                    id(immich_register_fetch_failure).execute();
+                    return;
+                  }
+                  id(immich_register_fetch_success).execute();
+                  int slot = id(espframe_core).slideshow().state().target_slot;
+                  auto &meta = get_slot(slot, id(espframe_core).slideshow().state().slot0, id(espframe_core).slideshow().state().slot1, id(espframe_core).slideshow().state().slot2);
+                  meta.filter_tag_scope_known = true;
+                  meta.filter_album_ids = id(immich_request_state).active_filter_branch.album_ids;
+                  meta.filter_person_ids = immich_asset_filter_scope(
+                    body, meta.asset_id, id(immich_request_state).active_filter_branch.person_ids, "people");
+                  if (meta.filter_person_ids.empty())
+                    meta.filter_person_ids = id(immich_request_state).active_filter_branch.person_ids;
+                  meta.filter_tag_ids = immich_asset_filter_scope(
+                    body, meta.asset_id, id(immich_request_state).active_filter_branch.tag_ids, "tags");
+                  if (meta.filter_tag_ids.empty())
+                    meta.filter_tag_ids = id(immich_request_state).active_filter_branch.tag_ids;
+                  ESP_LOGI("immich", "METADATA slot %d: %s | %s | %s | %s | portrait=%d",
+                           slot, meta.asset_id.c_str(), meta.date.c_str(), meta.person.c_str(), meta.location.c_str(), meta.is_portrait);
+                  id(espframe_core).slideshow().clear_preload_for_slot(
+                    slot, id(espframe_core).slideshow().state().portrait_preload_slot, id(espframe_core).slideshow().state().portrait_preload_left_ready,
+                    id(espframe_core).slideshow().state().portrait_preload_right_ready, id(espframe_core).slideshow().state().preload_noncritical_in_flight,
+                    id(espframe_core).slideshow().state().noncritical_remote_updates_in_flight);
+                  set_slot_image_url(slot, img_url, id(immich_img_0), id(immich_img_1), id(immich_img_2));
+              - lambda: |-
+                  execute_deferred_slot_image_update(
+                    id(espframe_core).slideshow().state().target_slot, id(deferred_slot0_image_update),
+                    id(deferred_slot1_image_update), id(deferred_slot2_image_update));
+          on_error:
+            then:
+              - lambda: |-
+                  id(immich_request_state).register_request_error();
+                  ESP_LOGW("immich", "Metadata page request error for slot %d (attempt %d)", id(espframe_core).slideshow().state().target_slot, id(immich_request_state).api_retries);
+                  clear_slot_fetch_in_flight(id(espframe_core).slideshow().state().target_slot, id(espframe_core).slideshow().state().slot_flags);
+                  id(espframe_core).slideshow().state().diagnostic_reason = "metadata page request error";
+                  id(log_immich_diag).execute();
+              - if:
+                  condition:
+                    lambda: 'return id(immich_request_state).retry_available(MAX_ERROR_RETRIES);'
+                  then:
+                    - script.execute: immich_fetch_retry
+                  else:
+                    - lambda: |-
+                        id(immich_request_state).reset_retries_and_pause(millis());
+                        ESP_LOGW("immich", "Metadata retries exhausted; pausing Immich fetches for 30s");
+
+  # ---------------------------------------------------------------------------
+  # Fetch API metadata and start image download into target_slot
+  # ---------------------------------------------------------------------------
+  - id: immich_fetch_into_slot
+    mode: single
+    then:
+      - lambda: |-
+          using esphome::espframe::SlotFetchDecision;
+          const auto decision = id(espframe_core).check_slot_fetch(
+            esphome::wifi::global_wifi_component->is_connected(),
+            !id(immich_url).state.empty() && !id(immich_api_key_value).empty(),
+            id(backlight_paused), id(immich_request_state).cooldown_active(millis()),
+            id(immich_img_0).is_downloading() || id(immich_img_1).is_downloading() ||
+            id(immich_img_2).is_downloading() || id(immich_portrait_left).is_downloading() ||
+            id(immich_portrait_right).is_downloading() || id(immich_portrait_preload_left).is_downloading() ||
+            id(immich_portrait_preload_right).is_downloading());
+          if (decision == SlotFetchDecision::ALLOW) return;
+          switch (decision) {
+            case SlotFetchDecision::WIFI_DISCONNECTED:
+              ESP_LOGD("immich", "Fetch paused (wifi disconnected)"); break;
+            case SlotFetchDecision::MISSING_CONFIG:
+              ESP_LOGW("immich", "Immich URL or API key not configured"); break;
+            case SlotFetchDecision::PAUSED:
+              ESP_LOGI("immich", "Fetch paused (backlight off)"); break;
+            case SlotFetchDecision::COOLDOWN:
+              ESP_LOGD("immich", "Fetch paused (connection retry cooldown)"); break;
+            case SlotFetchDecision::SLOT_BUSY:
+              ESP_LOGD("immich", "Slot %d fetch already in flight, skipping API fetch",
+                       id(espframe_core).slideshow().state().target_slot); break;
+            case SlotFetchDecision::IMAGE_BUSY:
+              ESP_LOGD("immich", "Fetch deferred (image download active)"); break;
+            case SlotFetchDecision::INVALID_SLOT:
+              ESP_LOGW("immich", "Fetch paused (invalid target slot)"); break;
+            default: break;
+          }
+          if (esphome::espframe::slot_fetch_needs_defer(decision)) id(delayed_prefetch_chain).execute();
+          // Stopping this script suppresses all subsequent actions, including
+          // marking a slot busy. Returning from a lambda alone would not.
+          id(immich_fetch_into_slot).stop();
+      - lambda: 'mark_slot_fetch_in_flight(id(espframe_core).slideshow().state().target_slot, id(espframe_core).slideshow().state().slot_flags, millis());'
+      - if:
+          condition:
+            lambda: |-
+              return immich_memories_source_active(id(photo_source_select).current_option()) &&
+                     !id(immich_request_state).memory_fallback;
+          then:
+            - script.execute: immich_fetch_memory_into_slot
+            - script.stop: immich_fetch_into_slot
+      - lambda: |-
+          if (id(immich_request_state).memory_fallback) {
+            id(immich_request_state).memory_fallback = false;
+          }
+      - script.execute: sync_immich_filter_config
+      - delay: 1ms
+      - if:
+          condition:
+            lambda: |-
+              const auto &config = id(immich_filter_config);
+              return immich_filter_has_missing_enabled_ids(config) ||
+                !immich_filter_location_is_valid(config) ||
+                (id(immich_request_state).api_generation == ImmichApiGeneration::V31_FLAT &&
+                 immich_filter_requires_v32(config));
+          then:
+            - lambda: |-
+                clear_slot_fetch_in_flight(
+                  id(espframe_core).slideshow().state().target_slot,
+                  id(espframe_core).slideshow().state().slot_flags);
+            - script.execute: immich_check_config_ready
+            - script.stop: immich_fetch_into_slot
+      - lambda: |-
+          if (id(immich_request_state).reuse_active_filter_branch) {
+            id(immich_request_state).reuse_active_filter_branch = false;
+          } else {
+            id(immich_request_state).empty_id_attempts = 0;
+            id(immich_request_state).active_filter_branch = select_immich_filter_branch(
+              id(immich_filter_config), id(immich_request_state).inclusion_group_index,
+              id(immich_request_state).album_order_index,
+              id(immich_album_order).current_option(),
+              id(immich_request_state).api_generation);
+          }
+          id(immich_request_state).metadata_album_id =
+            id(immich_request_state).active_filter_branch.album_ids;
+          id(immich_request_state).metadata_person_id =
+            id(immich_request_state).active_filter_branch.person_ids;
+          id(immich_request_state).metadata_tag_ids =
+            id(immich_request_state).active_filter_branch.tag_ids;
+      - if:
+          condition:
+            lambda: |-
+              return immich_filter_branch_uses_metadata_search(
+                id(immich_request_state).active_filter_branch,
+                id(immich_request_state).api_generation);
+          then:
+            - script.execute: immich_fetch_metadata_into_slot
+            - script.stop: immich_fetch_into_slot
+      - lambda: |-
+          bool batchable = immich_enabled_inclusion_groups(id(immich_filter_config)).empty();
+          id(immich_request_state).candidate_pool_hit = false;
+          if (batchable && !id(immich_candidate_pool).empty()) {
+            int slot = id(espframe_core).slideshow().state().target_slot;
+            std::string img_url = take_immich_candidate_and_fill_slot(
+              id(immich_candidate_pool), slot, id(espframe_core).slideshow().state().slot0,
+              id(espframe_core).slideshow().state().slot1,
+              id(espframe_core).slideshow().state().slot2);
+            if (!img_url.empty()) {
+              id(immich_request_state).candidate_pool_hit = true;
+              id(immich_fetch_started) = true;
+              id(immich_request_state).register_success();
+              id(espframe_core).slideshow().clear_preload_for_slot(
+                slot, id(espframe_core).slideshow().state().portrait_preload_slot,
+                id(espframe_core).slideshow().state().portrait_preload_left_ready,
+                id(espframe_core).slideshow().state().portrait_preload_right_ready,
+                id(espframe_core).slideshow().state().preload_noncritical_in_flight,
+                id(espframe_core).slideshow().state().noncritical_remote_updates_in_flight);
+              set_slot_image_url(slot, img_url, id(immich_img_0), id(immich_img_1), id(immich_img_2));
+              ESP_LOGD("immich", "Candidate pool served slot %d (%u remain)",
+                       slot, (unsigned) id(immich_candidate_pool).size());
+            }
+          }
+      - if:
+          condition:
+            lambda: 'return id(immich_request_state).candidate_pool_hit;'
+          then:
+            - lambda: |-
+                execute_deferred_slot_image_update(
+                  id(espframe_core).slideshow().state().target_slot,
+                  id(deferred_slot0_image_update), id(deferred_slot1_image_update),
+                  id(deferred_slot2_image_update));
+            - script.stop: immich_fetch_into_slot
+      - lambda: 'id(immich_request_state).begin_random_request();'
+      - http_request.post:
+          id: http_req
+          url: !lambda 'return id(immich_url).state + "/api/search/random";'
+          capture_response: true
+          max_response_buffer_size: 32kB
+          request_headers:
+            Content-Type: application/json
+            Accept: application/json
+            x-api-key: !lambda 'return id(immich_api_key_value).c_str();'
+          body: !lambda |-
+            bool batchable = immich_enabled_inclusion_groups(id(immich_filter_config)).empty();
+            int search_size = batchable ? IMMICH_RANDOM_POOL_SIZE :
+              (id(photo_orientation_filter).current_option() == "Any" ? 1 : 10);
+            return build_immich_filter_search_body(
+              id(immich_filter_config), id(immich_request_state).active_filter_branch,
+              id(immich_request_state).api_generation, search_size, true);
+          on_response:
+            then:
+              - if:
+                  condition:
+                    lambda: 'return !id(immich_request_state).random_request_is_current();'
+                  then:
+                    - logger.log:
+                        level: DEBUG
+                        tag: immich
+                        format: "Discarding response from previous photo source"
+                    - script.execute: delayed_prefetch_chain
+                    - script.stop: immich_fetch_into_slot
+              - lambda: |-
+                  id(espframe_core).record_memory("immich-response");
+                  if (response->status_code != 200) {
+                    int code = response->status_code;
+                    ESP_LOGW("immich", "HTTP %d from Immich", code);
+                    id(immich_request_state).note_http_failure(code, millis());
+                    clear_slot_fetch_in_flight(id(espframe_core).slideshow().state().target_slot, id(espframe_core).slideshow().state().slot_flags);
+                    if (is_http_auth_error(code)) {
+                      id(immich_source_setup_visible) = false;
+                      lv_obj_add_flag(id(photo_source_show_all_button), LV_OBJ_FLAG_HIDDEN);
+                      lv_label_set_text(id(connection_failed_title), "Invalid API Key");
+                      lv_label_set_text(id(connection_failed_subtitle), "Check your Immich API key in\nthe espframe settings.");
+                      lv_obj_clear_flag(id(connection_failed_overlay), LV_OBJ_FLAG_HIDDEN);
+                      id(connection_failed_dim).execute();
+                      id(connection_failed_shift).execute();
+                      return;
+                    } else if (is_http_retryable(code)) {
+                      id(immich_request_state).register_request_error();
+                      if (id(immich_request_state).retry_available(MAX_ERROR_RETRIES)) {
+                        id(immich_fetch_retry).execute();
+                        return;
+                      }
+                    }
+                    id(espframe_core).slideshow().state().diagnostic_reason = "api http status";
+                    id(log_immich_diag).execute();
+                    id(immich_register_fetch_failure).execute();
+                    return;
+                  }
+                  std::string orientation = id(photo_orientation_filter).current_option();
+                  bool batchable = immich_enabled_inclusion_groups(id(immich_filter_config)).empty();
+                  int slot = id(espframe_core).slideshow().state().target_slot;
+                  std::string img_url;
+                  if (batchable) {
+                    id(immich_candidate_pool).clear();
+                    append_immich_asset_candidates(
+                      body, id(immich_url).state, id(immich_candidate_pool), orientation,
+                      IMMICH_RANDOM_POOL_SIZE);
+                    img_url = take_immich_candidate_and_fill_slot(
+                      id(immich_candidate_pool), slot,
+                      id(espframe_core).slideshow().state().slot0,
+                      id(espframe_core).slideshow().state().slot1,
+                      id(espframe_core).slideshow().state().slot2);
+                  } else {
+                    img_url = parse_immich_asset_and_fill_slot(
+                      body, id(immich_url).state, slot,
+                      id(espframe_core).slideshow().state().slot0,
+                      id(espframe_core).slideshow().state().slot1,
+                      id(espframe_core).slideshow().state().slot2, orientation);
+                  }
+                  if (img_url.empty()) {
+                    clear_slot_fetch_in_flight(id(espframe_core).slideshow().state().target_slot, id(espframe_core).slideshow().state().slot_flags);
+                    if (id(immich_request_state).prepare_any_id_retry(id(immich_filter_config))) {
+                      id(immich_try_next_filter_branch).execute();
+                      return;
+                    }
+                    auto groups = immich_enabled_inclusion_groups(id(immich_filter_config));
+                    if (id(immich_filter_config).inclusion_matching == "Match any enabled group" &&
+                        groups.size() > 1 && ++id(immich_request_state).empty_branch_attempts < groups.size()) {
+                      ESP_LOGD("immich", "Empty smart-filter branch; trying the next enabled group");
+                      id(immich_try_next_filter_branch).execute();
+                      return;
+                    }
+                    if (orientation != "Any" && id(immich_request_state).retry_available(MAX_ERROR_RETRIES)) {
+                      id(immich_request_state).register_request_error();
+                      ESP_LOGW("immich", "No %s image in random response; retrying", orientation.c_str());
+                      id(immich_fetch_retry).execute();
+                      return;
+                    }
+                    ESP_LOGW("immich", "No valid asset in response");
+                    id(espframe_core).slideshow().state().diagnostic_reason = "no valid asset in response";
+                    id(log_immich_diag).execute();
+                    id(immich_register_fetch_failure).execute();
+                    return;
+                  }
+                  id(immich_register_fetch_success).execute();
+                  auto &meta = get_slot(slot, id(espframe_core).slideshow().state().slot0, id(espframe_core).slideshow().state().slot1, id(espframe_core).slideshow().state().slot2);
+                  meta.filter_tag_scope_known = true;
+                  meta.filter_album_ids = id(immich_request_state).active_filter_branch.album_ids;
+                  meta.filter_person_ids = immich_asset_filter_scope(
+                    body, meta.asset_id, id(immich_request_state).active_filter_branch.person_ids, "people");
+                  if (meta.filter_person_ids.empty())
+                    meta.filter_person_ids = id(immich_request_state).active_filter_branch.person_ids;
+                  meta.filter_tag_ids = immich_asset_filter_scope(
+                    body, meta.asset_id, id(immich_request_state).active_filter_branch.tag_ids, "tags");
+                  const bool requires_tag_scope_resolution =
+                    immich_filter_branch_requires_tag_scope_resolution(
+                      id(immich_filter_config), id(immich_request_state).active_filter_branch,
+                      id(immich_request_state).api_generation);
+                  if (meta.filter_tag_ids.empty() && !requires_tag_scope_resolution)
+                    meta.filter_tag_ids = id(immich_request_state).active_filter_branch.tag_ids;
+                  if (requires_tag_scope_resolution) {
+                    meta.filter_tag_scope_known = false;
+                    id(immich_request_state).begin_filter_scope_request(
+                      slot, meta.asset_id, id(immich_request_state).active_filter_branch.tag_ids);
+                  }
+                  ESP_LOGI("immich", "RANDOM slot %d: %s | %s | %s | %s | portrait=%d",
+                           slot, meta.asset_id.c_str(), meta.date.c_str(), meta.person.c_str(), meta.location.c_str(), meta.is_portrait);
+                  id(espframe_core).slideshow().clear_preload_for_slot(
+                    slot, id(espframe_core).slideshow().state().portrait_preload_slot, id(espframe_core).slideshow().state().portrait_preload_left_ready,
+                    id(espframe_core).slideshow().state().portrait_preload_right_ready, id(espframe_core).slideshow().state().preload_noncritical_in_flight,
+                    id(espframe_core).slideshow().state().noncritical_remote_updates_in_flight);
+                  set_slot_image_url(slot, img_url, id(immich_img_0), id(immich_img_1), id(immich_img_2));
+              - if:
+                  condition:
+                    lambda: 'return id(immich_request_state).filter_scope_request_pending();'
+                  then:
+                    - script.execute: immich_fetch_asset_tag_scope
+              - lambda: |-
+                  execute_deferred_slot_image_update(
+                    id(espframe_core).slideshow().state().target_slot, id(deferred_slot0_image_update),
+                    id(deferred_slot1_image_update), id(deferred_slot2_image_update));
+          on_error:
+            then:
+              - if:
+                  condition:
+                    lambda: 'return !id(immich_request_state).random_request_is_current();'
+                  then:
+                    - logger.log:
+                        level: DEBUG
+                        tag: immich
+                        format: "Discarding request error from previous photo source"
+                    - script.execute: delayed_prefetch_chain
+                    - script.stop: immich_fetch_into_slot
+              - lambda: |-
+                  id(immich_request_state).register_request_error();
+                  ESP_LOGW("immich", "API request error for slot %d (attempt %d)", id(espframe_core).slideshow().state().target_slot, id(immich_request_state).api_retries);
+                  clear_slot_fetch_in_flight(id(espframe_core).slideshow().state().target_slot, id(espframe_core).slideshow().state().slot_flags);
+                  id(espframe_core).slideshow().state().diagnostic_reason = "api request error";
+                  id(log_immich_diag).execute();
+              - if:
+                  condition:
+                    lambda: 'return id(immich_request_state).retry_available(MAX_ERROR_RETRIES);'
+                  then:
+                    - script.execute: immich_fetch_retry
+                  else:
+                    - lambda: |-
+                        id(espframe_core).slideshow().state().diagnostic_reason = "api retries exhausted";
+                        id(log_immich_diag).execute();
+                    - script.execute: immich_register_fetch_failure
+
+  - id: immich_fetch_retry
+    mode: restart
+    then:
+      - lambda: |-
+          uint32_t delay_ms = id(immich_request_state).prepare_retry_delay();
+          ESP_LOGW("immich", "Retrying Immich fetch in %us (attempt=%d, consecutive failures=%d)",
+                   (unsigned) (delay_ms / 1000), id(immich_request_state).api_retries + 1,
+                   id(immich_request_state).consecutive_failures);
+      - delay: !lambda 'return id(immich_request_state).retry_delay_ms;'
+      - script.execute: immich_fetch_into_slot
+
+  # ---------------------------------------------------------------------------
+  # Fetch a companion portrait from a similar date/time
+  # ---------------------------------------------------------------------------
+  - id: immich_fetch_portrait_companion
+    mode: single
+    then:
+      - if:
+          condition:
+            not:
+              wifi.connected:
+          then:
+            - logger.log:
+                level: DEBUG
+                tag: immich
+                format: "Companion search paused (wifi disconnected)"
+            - script.stop: immich_fetch_portrait_companion
+      - if:
+          condition:
+            lambda: 'return id(immich_url).state.empty() || id(immich_api_key_value).empty();'
+          then:
+            - script.stop: immich_fetch_portrait_companion
+      - if:
+          condition:
+            lambda: |-
+              const int slot = id(espframe_core).slideshow().state().companion_target_slot;
+              if (slot < 0 || slot > 2) return false;
+              return !get_slot(slot, id(espframe_core).slideshow().state().slot0,
+                               id(espframe_core).slideshow().state().slot1,
+                               id(espframe_core).slideshow().state().slot2).filter_tag_scope_known;
+          then:
+            - if:
+                condition:
+                  lambda: 'return id(immich_request_state).filter_scope_request_pending();'
+                then:
+                  - script.execute: deferred_companion_search
+                else:
+                  - script.execute: handle_companion_not_found
+            - script.stop: immich_fetch_portrait_companion
+      - if:
+          condition:
+            lambda: |-
+              return id(immich_img_0).is_downloading() ||
+                     id(immich_img_1).is_downloading() ||
+                     id(immich_img_2).is_downloading() ||
+                     id(immich_portrait_left).is_downloading() ||
+                     id(immich_portrait_right).is_downloading() ||
+                     id(immich_portrait_preload_left).is_downloading() ||
+                     id(immich_portrait_preload_right).is_downloading();
+          then:
+            - logger.log:
+                level: DEBUG
+                tag: immich
+                format: "Companion search deferred (image download active)"
+            - script.execute: deferred_companion_search
+            - script.stop: immich_fetch_portrait_companion
+      - lambda: |-
+          id(espframe_core).slideshow().state().portrait.companion_found = false;
+          id(espframe_core).slideshow().state().portrait_companion_url = "";
+          id(espframe_core).slideshow().state().portrait.right_requested = false;
+          if (id(espframe_core).slideshow().state().companion_target_slot == id(espframe_core).slideshow().state().active_slot) id(espframe_core).slideshow().state().portrait.workflow_busy = true;
+      - if:
+          condition:
+            lambda: 'return id(espframe_core).slideshow().state().companion_target_slot != id(espframe_core).slideshow().state().active_slot && id(espframe_core).slideshow().state().portrait.workflow_busy;'
+          then:
+            - script.execute: delayed_prefetch_chain
+            - script.stop: immich_fetch_portrait_companion
+      - lambda: |-
+          std::string dt = id(espframe_core).slideshow().state().portrait_search_datetime;
+          if (dt.size() < 10) {
+            ESP_LOGW("immich", "No datetime for companion search");
+            id(handle_companion_not_found).execute();
+            return;
+          }
+          std::string day = dt.substr(0, 10);
+          int range_days = id(espframe_core).slideshow().state().portrait_search_expanded
+            ? portrait_pairing_range_days(id(portrait_pairing_range).current_option()) : 0;
+          ESP_LOGD("immich", "Searching companion portrait for slot %d, date %s, range +/- %d day(s)",
+                   id(espframe_core).slideshow().state().companion_target_slot, day.c_str(), range_days);
+          id(espframe_core).slideshow().mark_portrait_search_request_started();
+      - http_request.post:
+          id: http_req
+          url: !lambda |-
+            return id(immich_url).state + (id(espframe_core).slideshow().state().portrait_search_exhaustive
+              ? "/api/search/metadata" : "/api/search/random");
+          capture_response: true
+          max_response_buffer_size: 48kB
+          request_headers:
+            Content-Type: application/json
+            Accept: application/json
+            x-api-key: !lambda 'return id(immich_api_key_value).c_str();'
+          body: !lambda |-
+            std::string datetime = id(espframe_core).slideshow().state().portrait_search_datetime;
+            std::string day = datetime.substr(0, 10);
+            ImmichDateRange range;
+            if (!immich_memories_source_active(id(photo_source_select).current_option())) {
+              auto now = id(sntp_time).now();
+              range = resolve_immich_date_filter(
+                id(immich_date_filter_enabled).state,
+                id(immich_date_filter_mode).current_option(),
+                (int) (id(immich_relative_amount).state + 0.5f),
+                id(immich_relative_unit).current_option(),
+                now.is_valid(), now.year, now.month, now.day_of_month,
+                id(immich_date_from).state, id(immich_date_to).state);
+              if (range.relative_skipped_for_invalid_time) {
+                ESP_LOGW("immich", "Relative date filter skipped for companion search because time is not valid");
+              }
+            }
+            int range_days = id(espframe_core).slideshow().state().portrait_search_expanded
+              ? portrait_pairing_range_days(id(portrait_pairing_range).current_option()) : 0;
+            auto dates = resolve_immich_companion_filter_dates(day, range, range_days);
+            const auto &primary = get_slot(
+              id(espframe_core).slideshow().state().companion_target_slot,
+              id(espframe_core).slideshow().state().slot0,
+              id(espframe_core).slideshow().state().slot1,
+              id(espframe_core).slideshow().state().slot2);
+            ImmichFilterConfig companion_config = id(immich_filter_config);
+            companion_config.taken_after = dates.first;
+            companion_config.taken_before = dates.second;
+            ImmichFilterBranch companion_branch;
+            companion_branch.group = "All";
+            companion_branch.album_ids = primary.filter_album_ids;
+            companion_branch.person_ids = primary.filter_person_ids;
+            companion_branch.tag_ids = primary.filter_tag_ids;
+            return build_immich_filter_search_body(
+              companion_config, companion_branch, id(immich_request_state).api_generation,
+              IMMICH_COMPANION_SEARCH_SIZE, false,
+              id(espframe_core).slideshow().state().portrait_search_exhaustive,
+              id(espframe_core).slideshow().state().portrait_search_page,
+              id(espframe_core).slideshow().state().portrait_search_cursor);
+          on_response:
+            then:
+              - lambda: |-
+                  id(espframe_core).record_memory("immich-response");
+                  if (!id(espframe_core).slideshow().portrait_search_response_is_current()) {
+                    ESP_LOGD("immich", "Ignoring stale companion search response");
+                    return;
+                  }
+                  if (response->status_code != 200) {
+                    ESP_LOGW("immich", "Companion search HTTP %d", response->status_code);
+                    id(espframe_core).slideshow().state().diagnostic_reason = "companion search http";
+                    id(log_immich_diag).execute();
+                    id(handle_companion_not_found).execute();
+                    return;
+                  }
+                  uint32_t next_page = 0;
+                  std::string next_cursor;
+                  std::string companion_url = find_immich_portrait_companion_url(
+                    body, id(immich_url).state, id(espframe_core).slideshow().state().portrait_primary_asset_id,
+                    id(espframe_core).slideshow().state().portrait_search_datetime,
+                    id(espframe_core).slideshow().state().portrait_search_exhaustive ? &next_page : nullptr,
+                    id(espframe_core).slideshow().state().portrait_search_exhaustive ? &next_cursor : nullptr);
+
+                  if (companion_url.empty()) {
+                    if (id(espframe_core).slideshow().state().advance_portrait_search(
+                          next_page, next_cursor,
+                          id(immich_request_state).api_generation == ImmichApiGeneration::V32_STRUCTURED,
+                          portrait_pairing_range_days(id(portrait_pairing_range).current_option()))) {
+                      ESP_LOGD("immich", "Continuing exhaustive companion metadata search");
+                      id(deferred_companion_search).execute();
+                      return;
+                    }
+                    ESP_LOGI("immich", "NO COMPANION found for slot %d", id(espframe_core).slideshow().state().companion_target_slot);
+                    id(handle_companion_not_found).execute();
+                    return;
+                  }
+                  id(espframe_core).slideshow().on_companion_found(
+                    companion_url, id(espframe_core).slideshow().state().portrait, id(espframe_core).slideshow().state().portrait_companion_url,
+                    id(espframe_core).slideshow().state().companion_target_slot, id(espframe_core).slideshow().state().active_slot, id(espframe_core).slideshow().state().slot0, id(espframe_core).slideshow().state().slot1, id(espframe_core).slideshow().state().slot2,
+                    id(espframe_core).slideshow().state().portrait_preload_slot, id(espframe_core).slideshow().state().portrait_preload_left_ready,
+                    id(espframe_core).slideshow().state().portrait_preload_right_ready);
+                  id(espframe_slideshow_dispatch).execute();
+          on_error:
+            then:
+              - lambda: |-
+                  if (!id(espframe_core).slideshow().portrait_search_response_is_current()) {
+                    ESP_LOGD("immich", "Ignoring stale companion search error");
+                    return;
+                  }
+                  ESP_LOGW("immich", "Companion search request failed");
+                  id(espframe_core).slideshow().state().diagnostic_reason = "companion search error";
+                  id(log_immich_diag).execute();
+                  id(handle_companion_not_found).execute();
+      - script.execute: delayed_prefetch_chain

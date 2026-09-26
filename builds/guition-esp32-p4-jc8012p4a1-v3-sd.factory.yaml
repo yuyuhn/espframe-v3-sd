@@ -1,0 +1,35 @@
+# =============================================================================
+# FACTORY FIRMWARE - Guition ESP32-P4 JC8012P4A1 V3 production silicon
+# =============================================================================
+# Secrets-free config for the ESPHome web installer. Boots into AP mode for
+# captive portal WiFi setup. This CI build is not used locally.
+# Use for rear-case marking 2628+ with ESP32-P4 v3 production silicon; keep the
+# new-panel build for engineering-sample units and the original build for 2627 or lower.
+# =============================================================================
+
+substitutions:
+  name: "immich-frame-10inch-v3-sd"
+  friendly_name: "Espframe 10inch V3 SD"
+  firmware_version: "0.0.0"
+
+packages:
+  espframe: !include ../devices/guition-esp32-p4-jc8012p4a1-v3-sd/packages.yaml
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+    # mipi_dsi is a patched copy: it passes phy_clk_src=0 so ESP-IDF picks the
+    # XTAL PHY clock on production P4 (v3) silicon instead of the PLL_F20M alias
+    # that aborts in the production-silicon clock-source selector.
+    components: [gsl3680, remote_image, ledc, espframe, mipi_dsi, sd_mmc_card, local_photo_frame, local_upload]
+  # sd_mmc_card is a local component (../components/sd_mmc_card) that mounts the
+  # SD card and powers the SDMMC I/O domain via the on-chip LDO channel 4, which
+  # the upstream / youkorr sd_mmc_card do not support on ESP32-P4.
+
+web_server:
+  port: 80
+  version: 3
+  js_url: ""
+  css_include: "../docs/public/webserver/style.css"
+  js_include: "../docs/public/webserver/immich-frame-v3-sd/app.js"

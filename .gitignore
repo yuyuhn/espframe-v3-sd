@@ -1,18 +1,18 @@
-# Build and Release Folders
-bin-debug/
-bin-release/
-[Oo]bj/
-[Bb]in/
+.DS_Store
+node_modules
+docs/.vitepress/dist
+docs/.vitepress/cache
+.esphome/
+**/dev.yaml
+!devices/guition-esp32-p4-jc8012p4a1/dev.yaml
+!devices/guition-esp32-p4-jc8012p4a1-v2/dev.yaml
+!devices/guition-esp32-p4-jc8012p4a1-v3/dev.yaml
+!devices/guition-esp32-p4-jc8012p4a1-v3-sd/dev.yaml
+**/secrets.yaml
+__pycache__/
+*.pyc
+backups/
 
-# Other files and folders
-.settings/
-
-# Executables
-*.swf
-*.air
-*.ipa
-*.apk
-
-# Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
-# should NOT be excluded as they contain compiler settings and other important
-# information for Eclipse / Flash Builder.
+# Local build artifacts (do not commit)
+dist/
+*.bin

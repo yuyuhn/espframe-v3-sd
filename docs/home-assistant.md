@@ -1,0 +1,73 @@
+---
+title: Espframe Home Assistant Integration
+description: Add Espframe to Home Assistant as an ESPHome device for optional OTA updates, controls, and dashboard visibility.
+---
+
+# Espframe Home Assistant Integration
+
+Home Assistant is **not required** — the frame works standalone. If you run [Home Assistant](https://www.home-assistant.io/), you can add it as an ESPHome device for updates and dashboard control.
+
+## Adding the Device
+
+Espframe runs on [ESPHome](https://esphome.io/), so Home Assistant often discovers it automatically.
+
+- **If discovered:** **Settings → Devices & Services** → **ESPHome: 1 device discovered** → **Configure** → **Submit**
+- **If not:** **Add Integration** → **ESPHome** → enter the device IP (on screen or web UI) → **Submit**
+
+## API Encryption
+
+Espframe uses **runtime-provisioned per-device Noise** encryption for its ESPHome connection. Home Assistant generates a unique encryption key when it first connects, sends it to the frame, and then reconnects over the encrypted API. Existing plaintext integrations migrate on their first connection without changing the device or its entities.
+
+Automatic key provisioning requires Home Assistant **2026.8.0** or newer. Home Assistant **2026.8.1** or newer is recommended because it also synchronizes the provisioned key with ESPHome Device Builder, preventing Device Builder from creating a competing key during adoption. Older Home Assistant versions can continue using ESPHome's temporary plaintext fallback until a key is provisioned.
+
+**No shared or build-generated encryption key** is included in Espframe firmware. No key is embedded in **public YAML**, **factory firmware**, or **release workflows**, and it is never exposed through the **device web UI** or **Espframe backups**. The generated key is **Stored in device preferences and preserved across normal OTA updates**. It is separate from the Immich API key entered in the Espframe web UI.
+
+**A full erase or factory reinstall may require Home Assistant reconfiguration** because it can remove the stored encryption key. Normal firmware updates and rollbacks use OTA and retain it.
+
+## Exposed Entities
+
+Under **Settings → Devices & Services → ESPHome** (device page):
+
+| Entity | Type | Description |
+|--------|------|-------------|
+| **Photos: Source** | Select | Deprecated preset adapter: All Photos, Favorites, Album, Person, Tag, Memories, or Custom — see [Smart Photo Filters](/photo-sources) |
+| **Photos: Album IDs** | Text | Comma-separated Immich album UUIDs |
+| **Photos: Album Labels** | Text | Optional friendly labels for saved album IDs |
+| **Photos: Person IDs** | Text | Comma-separated Immich person UUIDs |
+| **Photos: Person Labels** | Text | Optional friendly labels for saved person IDs |
+| **Photos: Tag IDs** | Text | Comma-separated Immich tag UUIDs |
+| **Photos: Tag Labels** | Text | Optional friendly labels for saved tag IDs |
+| **Photos: Date Filter** | Switch | Turns photo date filtering on or off |
+| **Photos: Date Filter Mode** | Select | Fixed Range or Relative Range |
+| **Photos: Date From** | Text | Fixed range start date, in `YYYY-MM-DD` format |
+| **Photos: Date To** | Text | Fixed range end date, in `YYYY-MM-DD` format |
+| **Photos: Relative Amount** | Number | Rolling date range amount |
+| **Photos: Relative Unit** | Select | Months or Years for the rolling date range |
+| **Photos: Orientation** | Select | Any, Portrait Only, or Landscape Only |
+| **Photos: Display Mode** | Select | Fill crops to cover the screen; Fit letterboxes without cropping |
+| **Photos: Slideshow Interval** | Select | 10s–24h between photos |
+| **Photos: Portrait Pairing** | Switch | Pair compatible portrait photos side-by-side |
+| **Photos: Portrait Pairing Range** | Select | Match portraits from the same day, ±1 day, or ±2 days |
+| **Photos: Paired Portraits Only** | Switch | Skip portrait photos unless a complete pair is ready |
+| **Screen: Connection Timeout** | Select | 30s–30min before showing connection-failed screen |
+| **Screen: Rotation** | Select | LVGL screen rotation: 0 or 180 degrees |
+| **Screen: Backlight** | Light | On/off and brightness (0–100%). Turning it off puts the frame to sleep; turning it on wakes manual sleep unless scheduled off-hours are active. |
+| **Screen: Sleep** | Button | Puts the display into the same sleep state as the touchscreen hold gesture, pausing slideshow fetches. |
+| **Screen: Wake** | Button | Wakes the display and resumes the slideshow. During scheduled off-hours, this is a temporary wake using the configured wake timeout. |
+| **Firmware: Auto Update** | Switch | Install updates when available |
+| **Firmware: Update Frequency** | Select | Hourly, Daily, Weekly, Monthly |
+| **Firmware: Check for Update** | Button | Manual stable update check |
+| **Firmware: Version** | Text Sensor | Installed version |
+| **ESP32-C6: Update Available** | Text Sensor | Wi-Fi coprocessor update status |
+| **ESP32-C6: Current Firmware** | Text Sensor | Installed Wi-Fi coprocessor firmware version |
+| **ESP32-C6: Available Firmware** | Text Sensor | Latest compatible Wi-Fi coprocessor firmware version |
+| **Firmware ESP32-C6: Check for Update** | Button | Manual Wi-Fi coprocessor update check |
+| **Firmware ESP32-C6: Install Update** | Button | Install the available Wi-Fi coprocessor firmware update |
+| **Network: Online** | Binary Sensor | Connection status |
+| **Network: WiFi Strength** | Sensor | Signal % |
+| **Network: IP Address** | Text Sensor | Device IP |
+| **Reset Reason** | Text Sensor | Last reboot reason |
+
+## Automations
+
+Use entities in automations, e.g.: press **Screen: Sleep** when a room becomes empty and **Screen: Wake** when it becomes occupied; change **Photos: Slideshow Interval**, **Photos: Source**, or the date filter by time; notify when **Network: Online** goes unavailable; trigger **Firmware: Check for Update** from a script.

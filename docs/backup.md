@@ -1,0 +1,116 @@
+---
+title: Back Up and Restore Espframe Settings
+description: Export and import Espframe settings as a JSON file to back up, restore, migrate, or clone a digital photo frame configuration.
+---
+
+# Back Up and Restore Espframe Settings
+
+Export your settings to a JSON file and import them back — useful for backups, migrating to a new device, or cloning a configuration across multiple frames.
+
+## Export
+
+1. Open the device web UI at `http://<device-ip>/`.
+2. Expand the **Backup** card.
+3. Click **Export**. A file named `espframe-config-YYYY-MM-DD.json` downloads to your browser.
+
+The export captures all user-facing settings from the current session:
+
+| Category | Settings |
+|----------|----------|
+| **Connection** | Immich server URL, API key |
+| **Photos** | Smart-filter groups and matching, favorites, rating, location, inclusions and exclusions, dates, orientation, portrait pairing, and display mode |
+| **Frequency** | Slideshow interval, connection timeout |
+| **Firmware Updates** | Display auto update, update frequency, WiFi firmware auto update |
+| **Clock** | Show clock, format, timezone |
+| **Screen Brightness** | Daytime brightness, nighttime brightness |
+| **Night Schedule** | Enable, on time, off time, wake timeout |
+| **Rotation** | Rotation |
+| **Screen Tone** | Tone adjustment, display tone, night tone adjustment, warm tone intensity, warm tone override |
+
+Firmware version, update status, sunrise/sunset, and current brightness are **not** included — these are device-specific or read-only.
+
+## Import
+
+1. Open the device web UI at `http://<device-ip>/`.
+2. Expand the **Backup** card.
+3. Click **Import** and select a previously exported `.json` file.
+4. Each setting is pushed to the device individually. The page refreshes when complete.
+
+Partial config files work — only settings present in the file are applied; everything else stays unchanged.
+
+Album IDs, Album Labels, Person IDs, Person Labels, Tag IDs, and Tag Labels each must be 255 characters or fewer after trimming, which matches the device storage limit. If an import file exceeds that for any of those fields, the web UI reports the skipped setting and keeps importing other valid fields.
+
+## File Format
+
+The export is a standard JSON file with a `version` field and grouped settings:
+
+```json
+{
+  "version": 3,
+  "exported_at": "2026-03-29T12:00:00.000Z",
+  "connection": { "immich_url": "...", "api_key": "..." },
+  "photos": {
+    "source": "Custom",
+    "albums_enabled": false,
+    "people_enabled": false,
+    "tags_enabled": false,
+    "inclusion_matching": "Match all enabled groups",
+    "favorite_mode": "Any",
+    "minimum_rating": "Any",
+    "album_order": "Random albums",
+    "album_ids": "",
+    "album_labels": "",
+    "person_ids": "",
+    "person_labels": "",
+    "tag_ids": "",
+    "tag_labels": "",
+    "date_filter_enabled": false,
+    "date_filter_mode": "Fixed Range",
+    "date_from": "",
+    "date_to": "",
+    "relative_amount": 1,
+    "relative_unit": "Years",
+    "orientation": "Any",
+    "portrait_pairing": true,
+    "portrait_pairing_range": "Same Day",
+    "portrait_pairs_only": false,
+    "display_mode": "Fill"
+  },
+  "frequency": { "interval": "15 seconds", "conn_timeout": "10 minutes" },
+  "firmware_updates": {
+    "auto_update": true,
+    "update_frequency": "Daily",
+    "wifi_auto_update": true
+  },
+  "clock": { "show": true, "format": "24 Hour", "timezone": "..." },
+  "screen": {
+    "brightness_day": 100,
+    "brightness_night": 75,
+    "schedule_enabled": false,
+    "schedule_on_hour": 6,
+    "schedule_off_hour": 23,
+    "schedule_wake_timeout": 60,
+    "base_tone_enabled": false,
+    "base_tone": 0,
+    "warm_tones_enabled": false,
+    "warm_tone_intensity": 50,
+    "warm_tone_override": false,
+    "rotation": "0"
+  }
+}
+```
+
+You can edit the file by hand before importing — useful for scripting or bulk-configuring devices.
+
+## Frame names
+
+Firmware with frame naming includes optional `identity: { "name": "Living Room" }`
+metadata in the existing version 3 backup format. Named frames download backups
+as `<hostname>-config-YYYY-MM-DD.json`; unnamed frames retain the default filename.
+
+When importing a backup containing a name, **Also restore frame name** is unchecked
+by default. Keep it unchecked to preserve the destination frame's name, or check
+it to restore the saved name. The hostname always uses the destination frame's
+own MAC suffix. After restoring a name, use **Device → System → Frame Name** to
+review the new address and choose **Save & Restart**. Restoring an empty name restores firmware
+defaults. Backups without identity metadata continue to import as before.

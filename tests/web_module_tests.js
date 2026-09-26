@@ -1,0 +1,476 @@
+const assert = require("assert/strict");
+const fs = require("fs");
+const path = require("path");
+
+const root = path.resolve(__dirname, "..");
+const template = fs.readFileSync(path.join(root, "docs/webserver/src/app.template.ts"), "utf8");
+const publicApp = fs.readFileSync(path.join(root, "docs/public/webserver/app.js"), "utf8");
+const endpointsSource = fs.readFileSync(path.join(root, "docs/webserver/src/endpoints.ts"), "utf8");
+const runtimeStateSource = fs.readFileSync(path.join(root, "docs/webserver/src/runtime_state.ts"), "utf8");
+const liveHelpersSource = fs.readFileSync(path.join(root, "docs/webserver/src/live_helpers.ts"), "utf8");
+const backupImportSource = fs.readFileSync(path.join(root, "docs/webserver/src/backup_import.ts"), "utf8");
+const immichApiSource = fs.readFileSync(path.join(root, "common/addon/immich_api.yaml"), "utf8");
+const immichFilterSource = fs.readFileSync(path.join(root, "common/addon/immich_filter.yaml"), "utf8");
+const timeSource = fs.readFileSync(path.join(root, "common/addon/time.yaml"), "utf8");
+const immichConfigSource = fs.readFileSync(path.join(root, "common/addon/immich_config.yaml"), "utf8");
+const slideshowScreenSource = fs.readFileSync(
+  path.join(root, "devices/guition-esp32-p4-jc8012p4a1/device/screen_slideshow.yaml"),
+  "utf8"
+);
+const loadingScreenSource = fs.readFileSync(
+  path.join(root, "devices/guition-esp32-p4-jc8012p4a1/device/screen_loading.yaml"),
+  "utf8"
+);
+const iconSource = fs.readFileSync(
+  path.join(root, "devices/guition-esp32-p4-jc8012p4a1/assets/icons.yaml"),
+  "utf8"
+);
+const displayDeviceSources = [
+  "devices/guition-esp32-p4-jc8012p4a1/device/device.yaml",
+  "devices/guition-esp32-p4-jc8012p4a1-v2/device/device.yaml"
+].map((filename) => fs.readFileSync(path.join(root, filename), "utf8"));
+const product = JSON.parse(fs.readFileSync(path.join(root, "product/espframe.json"), "utf8"));
+const supportButtonImage = fs.readFileSync(
+  path.join(root, "docs/webserver/src/buy_me_a_coffee_button.webp.b64"),
+  "utf8"
+).trim();
+
+const modules = {
+  "__ESPFRAME_WEB_FRAME_IDENTITY__": "frame_identity.ts",
+  "__ESPFRAME_WEB_CONTRACTS__": "web_contracts.ts",
+  "__ESPFRAME_WEB_APP_SHELL__": "app_shell.ts",
+  "__ESPFRAME_WEB_ENDPOINTS__": "endpoints.ts",
+  "__ESPFRAME_WEB_RUNTIME_STATE__": "runtime_state.ts",
+  "__ESPFRAME_WEB_STARTUP_WIZARD__": "startup_wizard.ts",
+  "__ESPFRAME_WEB_SETTINGS_IMMICH_CARDS__": "settings_immich_cards.ts",
+  "__ESPFRAME_WEB_SETTINGS_SCREEN_CARDS__": "settings_screen_cards.ts",
+  "__ESPFRAME_WEB_SETTINGS_FIRMWARE_CARD__": "settings_firmware_card.ts",
+  "__ESPFRAME_WEB_SETTINGS_CONTROLS__": "settings_controls.ts",
+  "__ESPFRAME_WEB_LIVE_HELPERS__": "live_helpers.ts",
+  "__ESPFRAME_WEB_BACKUP_IMPORT__": "backup_import.ts",
+};
+
+for (const [placeholder, filename] of Object.entries(modules)) {
+  assert.ok(template.includes(placeholder), `${placeholder} must be present in app.template.ts`);
+  const source = fs.readFileSync(path.join(root, "docs/webserver/src", filename), "utf8");
+  assert.ok(source.trim().length > 0, `${filename} must not be empty`);
+}
+
+assert.equal(/__ESPFRAME_[A-Z0-9_]+__/.test(publicApp), false, "public app must not contain generator placeholders");
+assert.match(publicApp, /function renderSettings\(\)/, "public app should include the settings renderer");
+assert.match(publicApp, /function importConfig\(\)/, "public app should include backup import behavior");
+assert.match(publicApp, /BACKUP_CONFIG_VERSION\s*=/, "public app should include generated backup version");
+assert.match(publicApp, /BACKUP_SCHEMA\s*=/, "public app should include generated backup schema");
+assert.match(publicApp, /function renderWizard\(\)/, "public app should include the startup wizard");
+assert.ok(publicApp.includes("/espframe/api/v1/configuration"), "public app should use the versioned configuration API");
+assert.ok(publicApp.includes("api_key_configured"), "public app should use write-only API-key status");
+assert.ok(!runtimeStateSource.includes("S.api_key"), "browser runtime state must not retain the API key");
+assert.ok(!/\bS\.api_key\b/.test(publicApp), "browser app must not retain the API key in S.api_key");
+assert.ok(!publicApp.includes("values.api_key"), "configuration verification must not read the API key value");
+const apiClientSource = fs.readFileSync(path.join(root, "docs/webserver/src/api_client.ts"), "utf8");
+assert.ok(endpointsSource.includes("apiClient.getConfigurationSnapshot"), "configuration reads should use the API client");
+assert.ok(apiClientSource.includes("private queue") && apiClientSource.includes("this.queue = request.catch"), "the API client should own the single write queue");
+assert.ok(apiClientSource.includes('kind: ApiErrorKind') && apiClientSource.includes('"conflict"'), "API errors should retain typed categories");
+assert.ok(
+  liveHelpersSource.includes("renderSettingsAfterEditing();") &&
+    runtimeStateSource.includes("renderTimer = setTimeout") &&
+    runtimeStateSource.includes("renderSettingsAfterEditing();"),
+  "live capability updates should render after the active settings edit finishes"
+);
+assert.ok(publicApp.includes("customElements.define"), "public app should register its component root");
+assert.ok(publicApp.includes('"album_order"'), "public app should include album order in photo-source apply keys");
+assert.ok(
+  publicApp.includes("function makeMemoriesCard()") &&
+    publicApp.includes('makeCollapsibleCard("Memories"') &&
+    publicApp.includes('makeCollapsibleCard("Filters"') &&
+    publicApp.includes("Memories Window") &&
+    publicApp.includes("Fallback to All Photos") &&
+    publicApp.includes("Using Memories disables any configured filters"),
+  "photo settings should expose a dedicated Memories panel and disabled filter panel"
+);
+assert.ok(
+  publicApp.includes('toggle.setAttribute("aria-disabled", "true")') &&
+    publicApp.includes("control.disabled = true") &&
+  "photo filter UI should disable content controls while Memories is active"
+);
+assert.ok(publicApp.includes("Move up"), "public app should include album reorder controls");
+assert.ok(publicApp.includes("movePhotoIdRow"), "public app should keep photo ID and label rows reorderable");
+assert.ok(
+  publicApp.includes("Requires Immich server version 3.2 or newer") &&
+    publicApp.includes('label: "Filter by "') &&
+    publicApp.includes("Filter by Location"),
+  "photo filters should expose progressive groups and clear compatibility guidance"
+);
+assert.ok(
+  publicApp.includes("Choose Any to clear") &&
+    publicApp.includes("String(optionEl.value) !== String(recoveryValue)"),
+  "compatibility mode should allow a saved unsupported rating to be cleared"
+);
+assert.ok(
+  publicApp.includes("disableEditing: !supportsStructured") &&
+    publicApp.includes("allowClearLast: !supportsStructured") &&
+    publicApp.includes("Saved exclusions can be removed"),
+  "compatibility mode should prevent new exclusions while allowing saved exclusions to be removed"
+);
+assert.ok(!publicApp.includes("Advanced inclusion options"),
+  "photo filters should not render the removed advanced inclusion panel");
+assert.ok(
+  !publicApp.includes("if (nextValue && index > 0") &&
+    publicApp.includes("S[spec[1]] = nextValue"),
+  "location fields should be independently saveable"
+);
+const filterFlush = immichFilterSource.slice(
+  immichFilterSource.indexOf("- id: flush_slots_and_refetch"),
+  immichFilterSource.indexOf("- id: auto_apply_photo_source")
+);
+assert.ok(
+  filterFlush.includes("id(immich_request_state).empty_branch_attempts = 0"),
+  "applying a photo filter should reset exhausted inclusion-branch attempts"
+);
+assert.ok(
+  filterFlush.includes("id(immich_request_state).empty_id_attempts = 0") &&
+    immichFilterSource.includes("reuse_active_filter_branch = false") &&
+    (immichApiSource.match(/prepare_any_id_retry/g) || []).length === 4,
+  "applying a photo filter should reset any-selected ID retry state"
+);
+assert.ok(
+  filterFlush.includes("slideshow().invalidate_filter_slots()"),
+  "applying a photo filter should invalidate backward-navigation history"
+);
+const statisticsFetch = immichApiSource.slice(
+  immichApiSource.indexOf("- id: immich_fetch_statistics_count"),
+  immichApiSource.indexOf("- id: immich_fetch_metadata_page_probe")
+);
+const albumCountFetch = immichApiSource.slice(
+  immichApiSource.indexOf("- id: immich_fetch_album_count"),
+  immichApiSource.indexOf("- id: immich_fetch_statistics_count")
+);
+const metadataPageFetch = immichApiSource.slice(
+  immichApiSource.indexOf("- id: immich_fetch_metadata_page\n"),
+  immichApiSource.indexOf("- id: immich_fetch_into_slot")
+);
+assert.ok(
+  [albumCountFetch, statisticsFetch, metadataPageFetch].every(
+    (fetch) =>
+      fetch.includes("note_http_failure(response->status_code") &&
+      fetch.includes("register_request_error()") &&
+      fetch.includes("id(immich_fetch_retry).execute()")
+  ),
+  "metadata HTTP failures should enter the bounded retry path"
+);
+assert.ok(
+  immichApiSource.includes("?withoutAssets=true") &&
+    immichApiSource.includes('api_generation == ImmichApiGeneration::V31_FLAT') &&
+    immichApiSource.includes("metadata_cursor") &&
+    immichApiSource.includes("parse_immich_metadata_next_cursor"),
+  "album compatibility should retain legacy payload minimization and use structured cursors"
+);
+assert.ok(
+  immichApiSource.includes("/api/memories?type=on_this_day&for=") &&
+    immichApiSource.includes("immich_memories_window_days") &&
+    immichApiSource.includes("immich_memory_fallback_or_empty") &&
+    immichApiSource.includes("immich_memory_request_failed") &&
+    immichApiSource.includes("reset_retries_and_pause(millis())") &&
+    immichApiSource.includes("retry_available(MAX_ERROR_RETRIES)") &&
+    immichApiSource.includes("memory_fallback") &&
+    immichApiSource.includes("memory_request_is_current") &&
+    immichApiSource.includes("MemoriesJsonParser") &&
+    immichApiSource.includes("!id(sntp_time).now().is_valid()") &&
+    !immichApiSource.includes("JsonDocument filter"),
+  "Memories should use the On This Day API with a configurable window and fallback"
+);
+assert.ok(
+  filterFlush.includes("script.stop: immich_fetch_memory_window_day") &&
+    filterFlush.includes("script.stop: immich_memory_request_failed") &&
+    filterFlush.includes("invalidate_photo_source_requests") &&
+    filterFlush.indexOf("invalidate_photo_source_requests") < filterFlush.indexOf("Photo source apply deferred") &&
+    timeSource.includes("script.execute: immich_fetch_into_slot"),
+  "photo-source changes should invalidate Memories workers and retry after time sync"
+);
+assert.ok(
+  filterFlush.includes("filter_apply_pending = true") &&
+    filterFlush.includes("filter_apply_pending = false") &&
+    immichConfigSource.includes("return id(immich_request_state).filter_apply_pending") &&
+    immichConfigSource.includes("script.execute: flush_slots_and_refetch"),
+  "capability recovery should flush a photo-filter apply deferred by compatibility mode"
+);
+const configReadiness = immichConfigSource.slice(
+  immichConfigSource.indexOf("- id: immich_check_config_ready"),
+  immichConfigSource.indexOf("- id: immich_retry_config_ready")
+);
+assert.ok(
+  configReadiness.indexOf("lvgl.page.show: slideshow_page") <
+    configReadiness.indexOf("script.stop: immich_check_config_ready"),
+  "configuration errors should navigate to the slideshow before showing its overlay"
+);
+const unsupportedFilterOverlay = configReadiness.slice(
+  configReadiness.indexOf('"Filter needs Immich 3.2+"'),
+  configReadiness.indexOf("clear_slot_fetch_in_flight")
+);
+assert.ok(
+  unsupportedFilterOverlay.includes("lv_obj_clear_flag(id(photo_source_show_all_button), LV_OBJ_FLAG_HIDDEN)"),
+  "an unsupported saved filter should expose the on-device All Photos recovery button"
+);
+assert.equal(
+  slideshowScreenSource.includes("slideshow_swipe_suppress_tap_until_ms) = 0"),
+  false,
+  "navigation feedback should not clear swipe tap suppression before release"
+);
+assert.ok(
+  slideshowScreenSource.includes("text_font: icon_font_setup") &&
+    slideshowScreenSource.includes("${icon_chevron_right}") &&
+    slideshowScreenSource.includes("${icon_chevron_left}") &&
+    iconSource.includes('icon_chevron_left: "\\U000F0141"') &&
+    iconSource.includes('icon_chevron_right: "\\U000F0142"'),
+  "slideshow navigation feedback should use icon-only chevrons"
+);
+assert.equal(
+  slideshowScreenSource.includes('"Next  >"') || slideshowScreenSource.includes('"<  Previous"'),
+  false,
+  "slideshow navigation feedback should not display next or previous text"
+);
+const navigationFeedbackSource = slideshowScreenSource.slice(
+  slideshowScreenSource.indexOf("id: slideshow_navigation_feedback\n"),
+  slideshowScreenSource.indexOf("id: slideshow_navigation_feedback_label\n")
+);
+assert.ok(
+  navigationFeedbackSource.includes("border_width: 0") &&
+    !navigationFeedbackSource.includes("border_color:") &&
+    !navigationFeedbackSource.includes("border_opa:"),
+  "slideshow navigation feedback should not display an outline"
+);
+assert.equal(
+  loadingScreenSource.includes('text: "Starting up"'),
+  false,
+  "the loading screen should not display a centered startup title"
+);
+displayDeviceSources.forEach((source) => {
+  assert.ok(
+    source.includes("slideshow_swipe_suppress_tap_until_ms) = millis() + 250"),
+    "each display revision should extend swipe tap suppression through release"
+  );
+});
+const legacyPreset = immichFilterSource.slice(
+  immichFilterSource.indexOf("- id: apply_legacy_photo_source_preset"),
+  immichFilterSource.indexOf("- id: flush_slots_and_refetch")
+);
+const legacyMigration = immichFilterSource.slice(
+  immichFilterSource.indexOf("esphome:"),
+  immichFilterSource.indexOf("select:")
+);
+const legacySourceSelect = immichFilterSource.slice(
+  immichFilterSource.indexOf('name: "Photos: Source"'),
+  immichFilterSource.indexOf('name: "Photos: Inclusion Groups"')
+);
+const groupMigration = legacyMigration.slice(legacyMigration.indexOf("immich_filter_schema_version) < 2"));
+assert.ok(!groupMigration.includes(".set_option("),
+  "group toggle migration must preserve saved matching modes");
+assert.ok(groupMigration.indexOf("immich_filter_preset_adapter_active) = true") <
+  groupMigration.indexOf(".turn_on()") &&
+  groupMigration.includes("immich_filter_preset_adapter_active) = adapter_active"),
+  "migration must suppress preset callbacks while restoring group toggles");
+["album", "person", "tag"].forEach(function (noun) {
+  assert.ok(groupMigration.includes("immich_excluded_" + noun + "_ids).state.empty()"),
+    "migration must retain exclusion-only " + noun + " filters");
+});
+assert.ok(
+  legacyMigration.includes("preserve_tag_matching: true"),
+  "legacy schema migration should preserve the restored tag-matching preference"
+);
+assert.ok(
+  legacySourceSelect.includes("immich_filter_boot_restore_complete") &&
+    legacySourceSelect.includes("preserve_tag_matching: false"),
+  "only explicit post-restore legacy source selections should reset preset defaults"
+);
+assert.ok(
+  legacyMigration.includes("immich_filter_boot_restore_complete) = true") &&
+    legacyMigration.indexOf("immich_filter_boot_restore_complete) = true") >
+      legacyMigration.indexOf("preserve_tag_matching: true"),
+  "boot restoration should remain guarded until legacy filter migration finishes"
+);
+assert.ok(
+  legacyPreset.includes("if (!preserve_tag_matching)") &&
+    legacyPreset.includes('set_option(id(immich_tag_matching), "Any selected tag")'),
+  "legacy preset adapter should reset tag matching only outside schema migration"
+);
+assert.ok(
+  legacyPreset.includes('if (source == "Memories")') &&
+    legacyPreset.includes("id(immich_memories_active) = true") &&
+    legacyPreset.includes("return;"),
+  "selecting Memories should activate the exclusive source without overwriting saved filters"
+);
+assert.ok(
+  legacyPreset.includes('if (source == "Custom") return;') &&
+    !legacyPreset.includes("was_memories") &&
+    !legacyPreset.includes('source == "All Photos" || source == "Custom"'),
+  "leaving Memories for a legacy source should apply its preset and clear active filters"
+);
+[
+  "Match all enabled groups",
+  "Any selected album",
+  "Any selected person",
+  "Any selected tag"
+].forEach(function (defaultMode) {
+  assert.ok(
+    legacyPreset.includes('set_option(id(') && legacyPreset.includes('"' + defaultMode + '"'),
+    "legacy photo-source presets should restore " + defaultMode
+  );
+});
+// The legacy renderer remains available in authored source; the module bundler
+// omits it from the current UI because makeFiltersCard uses the smart filter.
+const immichCardsSource = fs.readFileSync(path.join(root, "docs/webserver/src/settings_immich_cards.ts"), "utf8");
+const photoSourceApply = immichCardsSource.slice(
+  immichCardsSource.indexOf("function applyPhotoSourceInputs()"),
+  immichCardsSource.indexOf("function schedulePhotoSourceApply")
+);
+assert.ok(
+  photoSourceApply.indexOf("if (!vals) return;") < photoSourceApply.indexOf("pendingPhotoSourceSave = {"),
+  "photo-source validation must preserve pending source changes until the first required ID is valid"
+);
+assert.match(supportButtonImage, /^UklGR/, "support button asset should be a base64-encoded WebP image");
+assert.ok(
+  publicApp.includes(`data:image/webp;base64,${supportButtonImage}`),
+  "public app should embed the Buy Me a Coffee button image"
+);
+assert.equal(
+  publicApp.includes(product.project.support_button_image_url),
+  false,
+  "embedded dashboard should not fetch the support button from a third party"
+);
+assert.ok(publicApp.includes('image.alt = "Buy Me A Coffee"'), "support button image should have accessible text");
+
+const backupImportContext = { JSON };
+require("vm").runInNewContext(require("esbuild").transformSync(backupImportSource, { loader: "ts" }).code, backupImportContext);
+const connectionOnlyBackup = backupImportContext.migrateBackupConfig({
+  version: 1,
+  connection: { immich_url: "https://photos.example.com" }
+});
+assert.equal(
+  Object.prototype.hasOwnProperty.call(connectionOnlyBackup, "photos"),
+  false,
+  "migrating a partial v1 backup must not synthesize omitted photo settings"
+);
+const displayOnlyBackup = backupImportContext.migrateBackupConfig({
+  version: 1,
+  photos: { display_mode: "Fit" }
+});
+assert.deepEqual(
+  JSON.parse(JSON.stringify(displayOnlyBackup.photos)),
+  { display_mode: "Fit" },
+  "migrating a v1 photo group without a source must preserve the current photo filter"
+);
+const legacyAlbumBackup = backupImportContext.migrateBackupConfig({
+  version: 1,
+  photos: { source: "Album" }
+});
+assert.equal(legacyAlbumBackup.photos.albums_enabled, true, "legacy Album sources should enable the album group");
+assert.equal(legacyAlbumBackup.photos.source, "Album", "legacy photo sources should remain available to firmware migration");
+const migratedFilterBackup = backupImportContext.migrateBackupConfig({
+  version: 2,
+  photos: { favorite_mode: "Favorites only", minimum_rating: "4+", city: "Wellington" }
+});
+assert.equal(migratedFilterBackup.version, 3, "older filter backups should migrate to version 3");
+assert.equal(migratedFilterBackup.photos.favorites_enabled, true, "saved favorite mode should enable favorite filtering");
+assert.equal(migratedFilterBackup.photos.rating_enabled, true, "saved rating should enable rating filtering");
+assert.equal(migratedFilterBackup.photos.location_enabled, true, "saved location should enable location filtering");
+
+const exclusionBackup = JSON.parse(fs.readFileSync(path.join(root, "tests/fixtures/backup/espframe-config-v2-full.json"), "utf8"));
+["albums", "people", "tags"].forEach(function (group) { exclusionBackup.photos[group + "_enabled"] = false; });
+const restoredExclusions = backupImportContext.migrateBackupConfig(exclusionBackup);
+["albums", "people", "tags"].forEach(function (group) {
+  assert.equal(restoredExclusions.photos[group + "_enabled"], true, "v2 exclusions must enable " + group);
+  assert.equal(exclusionBackup.photos[group + "_enabled"], false, "migration must not mutate its input");
+});
+assert.equal(restoredExclusions.photos.person_matching, exclusionBackup.photos.person_matching);
+const currentExclusions = backupImportContext.migrateBackupConfig({ ...exclusionBackup, version: 3 });
+assert.equal(currentExclusions.photos.tags_enabled, false, "v3 disabled exclusions must stay disabled");
+const emptyExclusions = backupImportContext.migrateBackupConfig({
+  version: 2, photos: { albums_enabled: false, excluded_album_ids: "  ", people_enabled: true }
+});
+assert.equal(emptyExclusions.photos.albums_enabled, false);
+assert.equal(emptyExclusions.photos.people_enabled, true);
+assert.equal(Object.prototype.hasOwnProperty.call(emptyExclusions.photos, "tags_enabled"), false);
+
+// The web server identifies each entity with name_id ("domain/Friendly Name") plus a
+// legacy id ("domain-object_id"). ENTITY_STATE_MAP and the REST endpoints both use the
+// name form, so live events must be resolved via name_id or nothing ever matches.
+assert.ok(
+  publicApp.includes("d.name_id"),
+  "live state events should be resolved by name_id, not the legacy object-id form"
+);
+
+assert.ok(
+  publicApp.includes("Promise.all([deviceCheck, publicCheck])"),
+  "firmware checks should accept the public release index when the device update entity is slow or unavailable"
+);
+assert.ok(
+  publicApp.includes("waitForFirmwareUpdateResponse(12)"),
+  "firmware checks should wait for the asynchronous device update result instead of reading UNKNOWN once"
+);
+
+// Exercise production disclosure helpers with bubbling clicks so header clicks
+// and native button activation cannot diverge or toggle a card twice.
+function disclosureElement(tagName, className = "") {
+  const classes = new Set(className.split(" ").filter(Boolean));
+  const attributes = new Map();
+  return {
+    tagName: tagName.toUpperCase(),
+    children: [],
+    classList: {
+      add: (name) => classes.add(name),
+      contains: (name) => classes.has(name),
+      toggle(name) {
+        if (classes.has(name)) classes.delete(name);
+        else classes.add(name);
+      },
+    },
+    appendChild(child) {
+      child.parentElement = this;
+      this.children.push(child);
+    },
+    setAttribute: (name, value) => attributes.set(name, String(value)),
+    getAttribute: (name) => attributes.get(name) ?? null,
+    click() {
+      let stopped = false;
+      const event = { stopPropagation() { stopped = true; } };
+      for (let node = this; node && !stopped; node = node.parentElement) {
+        if (node.onclick) node.onclick(event);
+      }
+    },
+  };
+}
+const disclosureContext = {
+  el: disclosureElement,
+  document: { createElement: disclosureElement },
+};
+const disclosureSource = liveHelpersSource.slice(
+  liveHelpersSource.indexOf("  var controlId = 0;"),
+  liveHelpersSource.indexOf("  function makeBackupCard()")
+);
+require("vm").runInNewContext(require("esbuild").transformSync(disclosureSource, { loader: "ts" }).code, disclosureContext);
+const disclosureIds = new Set();
+for (const initiallyCollapsed of [true, false]) {
+  const card = disclosureContext.makeCollapsibleCard("Settings", disclosureElement("div"), initiallyCollapsed);
+  const [header, body] = card.children;
+  const toggle = header.children[0].children[0];
+  const chevron = header.children[1].children[0];
+  assert.equal(toggle.tagName, "BUTTON");
+  assert.equal(toggle.type, "button");
+  assert.ok(body.id, "disclosure content must have an ID");
+  assert.equal(toggle.getAttribute("aria-controls"), body.id);
+  assert.equal(disclosureIds.has(body.id), false, "each card needs its own content ID");
+  disclosureIds.add(body.id);
+  let expanded = !initiallyCollapsed;
+  function assertDisclosureState() {
+    assert.equal(toggle.getAttribute("aria-expanded"), String(expanded));
+    assert.equal(card.classList.contains("collapsed"), !expanded);
+  }
+  assertDisclosureState();
+  for (const target of [toggle, toggle, header, chevron]) {
+    target.click();
+    expanded = !expanded;
+    assertDisclosureState();
+  }
+}
+
+console.log("web module tests passed");

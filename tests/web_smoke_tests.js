@@ -1,0 +1,2153 @@
+const assert = require("assert/strict");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { spawn } = require("child_process");
+
+const root = path.resolve(__dirname, "..");
+const appSource = fs.readFileSync(path.join(root, "docs/public/webserver/app.js"), "utf8");
+const product = JSON.parse(fs.readFileSync(path.join(root, "product/espframe.json"), "utf8"));
+const expectedBackupGroups = product.project.backup_export_groups;
+const expectedBackupFields = product.project.backup_export_fields;
+const configurationKeyByEndpointName = {};
+for (const setting of product.settings) {
+  configurationKeyByEndpointName[setting.entity.name] = setting.key;
+}
+for (const collectionName of ["web_static_entities", "web_manual_entities"]) {
+  for (const [key, spec] of Object.entries(product.project[collectionName] || {})) {
+    const entity = String(spec.entity || "");
+    const slash = entity.indexOf("/");
+    const domain = slash === -1 ? "" : entity.slice(0, slash);
+    if (["number", "select", "switch", "text"].includes(domain)) {
+      configurationKeyByEndpointName[entity.slice(slash + 1)] = key;
+    }
+  }
+}
+const smokeAlbumIds = [
+  "11111111-1111-4111-8111-111111111111",
+  "44444444-4444-4444-8444-444444444444",
+];
+const smokeAlbumLabels = ["Family", "Travel"];
+const v2ExclusionBackupFixture = {
+  version: 2,
+  photos: {
+    albums_enabled: false, people_enabled: false, tags_enabled: false,
+    excluded_album_ids: smokeAlbumIds[0],
+    excluded_person_ids: smokeAlbumIds[0],
+    excluded_tag_ids: smokeAlbumIds[0]
+  }
+};
+
+function findExecutable(name) {
+  const pathDirs = String(process.env.PATH || "")
+    .split(path.delimiter)
+    .filter(Boolean);
+  for (const dir of pathDirs) {
+    const candidate = path.join(dir, name);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return "";
+}
+
+function resolveChromePath() {
+  const candidates = [
+    process.env.CHROME_BIN,
+    process.env.CHROME_PATH,
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    findExecutable("google-chrome"),
+    findExecutable("google-chrome-stable"),
+    findExecutable("chromium"),
+    findExecutable("chromium-browser"),
+  ];
+  return candidates.find((candidate) => candidate && fs.existsSync(candidate)) || "";
+}
+
+const chromePathCandidates = [
+  process.env.CHROME_BIN,
+  process.env.CHROME_PATH,
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  "/Applications/Chromium.app/Contents/MacOS/Chromium",
+  "/usr/bin/google-chrome",
+  "/usr/bin/google-chrome-stable",
+  "/usr/bin/chromium",
+  "/usr/bin/chromium-browser",
+  "google-chrome",
+  "google-chrome-stable",
+  "chromium",
+  "chromium-browser",
+].filter(Boolean);
+const chromePath = resolveChromePath();
+
+function requireChromePath() {
+  if (!chromePath) {
+    throw new Error(`Google Chrome or Chromium is required for browser smoke tests. Checked: ${chromePathCandidates.join(", ")}`);
+  }
+  return chromePath;
+}
+
+function chromeSandboxArgs() {
+  if (process.platform !== "linux") return [];
+  if (typeof process.getuid !== "function" || process.getuid() !== 0) return [];
+  return ["--no-sandbox"];
+}
+
+const validBackupFixture = {
+  version: 1,
+  connection: {
+    immich_url: "https://imported.photos.example.com",
+    api_key: "imported-api-key",
+  },
+  photos: {
+    source: "Person",
+    album_ids: "11111111-1111-4111-8111-111111111111",
+    album_labels: "Family",
+    person_ids: "22222222-2222-4222-8222-222222222222",
+    person_labels: "Alex",
+    tag_ids: "33333333-3333-4333-8333-333333333333",
+    tag_labels: "Espframe",
+    date_filter_enabled: true,
+    date_filter_mode: "Relative Range",
+    relative_amount: 3,
+    relative_unit: "Years",
+    orientation: "Portrait Only",
+    portrait_pairing: true,
+    portrait_pairing_range: "Within 2 Days",
+    portrait_pairs_only: true,
+    display_mode: "Fill",
+  },
+  frequency: {
+    interval: "30 seconds",
+    conn_timeout: "5 minutes",
+  },
+  firmware_updates: {
+    auto_update: true,
+    update_frequency: "Weekly",
+    wifi_auto_update: true,
+  },
+  clock: {
+    show: true,
+    format: "24 Hour",
+    timezone: "Europe/London (GMT+0)",
+    ntp_servers: ["0.pool.ntp.org", "1.pool.ntp.org", "2.pool.ntp.org"],
+  },
+  screen: {
+    brightness_day: 90,
+    brightness_night: 60,
+    schedule_enabled: true,
+    schedule_on_hour: 7,
+    schedule_off_hour: 22,
+    schedule_wake_timeout: 120,
+    base_tone_enabled: true,
+    base_tone: 35,
+    warm_tones_enabled: true,
+    warm_tone_intensity: 45,
+    warm_tone_override: false,
+    rotation: "180",
+  },
+};
+
+const rejectedBackupFixture = {
+  version: 1,
+  photos: {
+    album_ids: "not-an-album-uuid",
+  },
+};
+
+const partialBackupFixture = {
+  version: 1,
+  connection: {
+    immich_url: "https://partial-import.photos.example.com",
+  },
+  photos: {
+    album_ids: "not-an-album-uuid",
+  },
+};
+
+const missingVersionBackupFixture = {
+  photos: {
+    source: "Album",
+  },
+};
+
+const futureVersionBackupFixture = {
+  version: 4,
+  connection: {
+    immich_url: "https://future.photos.example.com",
+  },
+};
+
+const unsupportedVersionBackupFixture = {
+  version: 0,
+  connection: {
+    immich_url: "https://unsupported.photos.example.com",
+  },
+};
+
+const scenarios = [
+  ...[false, true].map(legacy => ({ name: "frame-name-delayed-" + (legacy ? "legacy" : "export"), configured: true, width: 390, height: 900, identity: !legacy, delayedIdentity: true })),
+  { name: "frame-name-long", configured: true, width: 390, height: 900, identity: true, initialName: "x".repeat(120) },
+  { name: "frame-name", configured: true, width: 390, height: 900, identity: true },
+  { name: "frame-name-restart-failure", configured: true, width: 1280, height: 900, identity: true, failedPostEndpoint: "Device: Reboot Screen" },
+  { name: "frame-name-failure", configured: true, width: 1280, height: 900, identity: true, identityFailure: true },
+  ...[false, true].map(restoreName => ({
+    name: "frame-name-import-" + (restoreName ? "restore" : "keep"),
+    configured: true, width: 1280, height: 900, identity: true, restoreName,
+    importFixture: { version: 3, identity: { name: "Office" }, screen: { brightness_day: 80 } }
+  })),
+  { name: "refresh-startup", configured: true, width: 1280, height: 900, slowStartup: true },
+  { name: "refresh-startup-legacy", configured: true, width: 1280, height: 900, slowStartup: true, legacyStartup: true },
+  { name: "refresh-startup-legacy-snapshot", configured: true, width: 1280, height: 900, slowStartup: true, legacyConfigurationSnapshot: true },
+  { name: "refresh-startup-late", configured: true, width: 1280, height: 900, slowStartup: true, startupDelayMs: 5000 },
+  { name: "refresh-startup-pending", configured: true, width: 1280, height: 900, slowStartup: true, startupDelayMs: 5000, noStartupSse: true },
+  { name: "wizard", configured: false, width: 1280, height: 900 },
+  { name: "wizard-connection-save", configured: false, width: 1280, height: 900 },
+  { name: "wizard-connection-save-legacy", configured: false, width: 1280, height: 900, legacyApi: true },
+  { name: "settings", configured: true, width: 1280, height: 900 },
+  { name: "connection-overlapping-url-saves", configured: true, width: 1280, height: 900 },
+  { name: "settings-accessibility", configured: true, width: 1280, height: 900 },
+  { name: "setting-save-rejected", configured: true, width: 1280, height: 900, failedPostEndpoint: "Screen: Daytime Brightness" },
+  { name: "settings-mobile", configured: true, width: 390, height: 900 },
+  ...["3.1.0", "Unknown", "3.2.0"].map((version) => ({
+    name: "filter-compatibility-" + version.toLowerCase().replace(/\./g, "-"),
+    configured: true, width: 1280, height: 900, filterCompatibilityVersion: version
+  })),
+  { name: "firmware-main-install", configured: true, width: 1280, height: 900 },
+  { name: "firmware-main-install-from-development-build", configured: true, width: 1280, height: 900, installedFirmwareVersion: "dev" },
+  { name: "firmware-c6-install", configured: true, width: 1280, height: 900 },
+  { name: "firmware-rollback", configured: true, width: 1280, height: 900 },
+  { name: "firmware-rollback-failure", configured: true, width: 1280, height: 900, firmwareUploadFails: true },
+  { name: "firmware-index-unavailable", configured: true, width: 1280, height: 900, firmwareIndexUnavailable: true, firmwareDeviceInstallFails: true },
+  { name: "firmware-index-replaces-stale-device", configured: true, width: 1280, height: 900, firmwareManifestUnavailable: true, firmwareIndexLatestVersion: "v1.0.2", firmwareDeviceLatestVersion: "v1.0.1", firmwareStaleDeviceMetadata: true },
+  { name: "firmware-manifest-sse-update", configured: true, width: 1280, height: 900, firmwareStaleSseUpdate: true },
+  { name: "firmware-newer-prerelease", configured: true, width: 1280, height: 900, installedFirmwareVersion: "v1.2.0-beta.1" },
+  ...(product.devices[1]
+    ? [{ name: "firmware-second-device-index", configured: true, width: 1280, height: 900, firmwareDeviceSlug: product.devices[1].slug }]
+    : []),
+  { name: "photo-source-reorder", configured: true, width: 1280, height: 900 },
+  { name: "screen-rotation-developer", configured: true, width: 1280, height: 900, query: "dev=experimental" },
+  { name: "screen-tone-schedule", configured: true, width: 1280, height: 900 },
+  { name: "daily-settings-controls", configured: true, width: 1280, height: 900 },
+  { name: "backup-import-success", configured: true, width: 1280, height: 900, importFixture: validBackupFixture },
+  { name: "backup-import-v2-exclusions", configured: true, width: 1280, height: 900, importFixture: v2ExclusionBackupFixture },
+  { name: "backup-import-save-failure", configured: true, width: 1280, height: 900, importFixture: validBackupFixture, failedPostEndpoint: "Screen: Daytime Brightness" },
+  { name: "backup-import-partial", configured: true, width: 1280, height: 900, importFixture: partialBackupFixture },
+  { name: "backup-import-rejected", configured: true, width: 1280, height: 900, importFixture: rejectedBackupFixture },
+  { name: "backup-import-missing-version", configured: true, width: 1280, height: 900, importFixture: missingVersionBackupFixture },
+  { name: "backup-import-future-version", configured: true, width: 1280, height: 900, importFixture: futureVersionBackupFixture },
+  { name: "backup-import-unsupported-version", configured: true, width: 1280, height: 900, importFixture: unsupportedVersionBackupFixture },
+];
+
+function browserScriptForScenario(scenario) {
+  const firmwareDeviceSlug = scenario.firmwareDeviceSlug || product.devices[0].slug;
+  const installedFirmwareVersion = scenario.installedFirmwareVersion || "v1.0.0";
+  return `
+    window.__smoke = {
+      posts: [],
+      postRecords: [],
+      errors: [],
+      fetchedUrls: [],
+      downloads: 0,
+      exportPayloads: [],
+      inputClicks: 0,
+      importFixture: ${JSON.stringify(scenario.importFixture || null)},
+      failedPostEndpoint: ${JSON.stringify(scenario.failedPostEndpoint || "")},
+      firmwareIndexUnavailable: ${JSON.stringify(!!scenario.firmwareIndexUnavailable)},
+      firmwareManifestUnavailable: ${JSON.stringify(!!scenario.firmwareManifestUnavailable)},
+      firmwareDeviceInstallFails: ${JSON.stringify(!!scenario.firmwareDeviceInstallFails)},
+      firmwareStaleSseUpdate: ${JSON.stringify(!!scenario.firmwareStaleSseUpdate)},
+      firmwareStaleDeviceMetadata: ${JSON.stringify(!!scenario.firmwareStaleDeviceMetadata)},
+      firmwareUploadFails: ${JSON.stringify(!!scenario.firmwareUploadFails)}
+    };
+    window.addEventListener("error", function (event) {
+      window.__smoke.errors.push(event.message || "browser error");
+    });
+    window.addEventListener("unhandledrejection", function (event) {
+      window.__smoke.errors.push(String(event.reason || "unhandled rejection"));
+    });
+
+    const NativeBlob = window.Blob;
+    window.Blob = class SmokeBlob extends NativeBlob {
+      constructor(parts, options) {
+        super(parts, options);
+        this.__smokeText = (parts || []).map((part) => typeof part === "string" ? part : "").join("");
+      }
+    };
+
+    URL.createObjectURL = function (blob) {
+      if (blob && typeof blob.__smokeText === "string") window.__smoke.exportPayloads.push(blob.__smokeText);
+      return "blob:espframe-smoke";
+    };
+    URL.revokeObjectURL = function () {};
+    HTMLAnchorElement.prototype.click = function () {
+      if (this.download) { window.__smoke.downloads += 1; window.__smoke.downloadName = this.download; }
+    };
+    FileReader.prototype.readAsText = function (file) {
+      Object.defineProperty(this, "result", { configurable: true, value: file && file.__smokeContent ? file.__smokeContent : "" });
+      if (this.onload) setTimeout(() => this.onload({ target: this }), 0);
+    };
+    HTMLInputElement.prototype.click = function () {
+      if (this.type !== "file") return;
+      window.__smoke.inputClicks += 1;
+      if (!window.__smoke.importFixture) return;
+      Object.defineProperty(this, "files", {
+        configurable: true,
+        value: [{ name: "espframe-config-smoke.json", __smokeContent: JSON.stringify(window.__smoke.importFixture) }]
+      });
+      setTimeout(() => this.dispatchEvent(new Event("change")), 0);
+    };
+
+    class SmokeEventSource {
+      constructor(url) {
+        this.url = url;
+        window.__smoke.eventSource = this;
+        this.listeners = {};
+        setTimeout(() => {
+          if (this.onopen) this.onopen({ type: "open" });
+          if (${JSON.stringify(!!scenario.slowStartup && !scenario.legacyStartup && !scenario.noStartupSse)}) {
+            this.dispatch("state", { id: "text/Connection: Server URL", value: "https://photos.example.com" });
+          }
+          this.dispatch("log", { msg: "Smoke log line", lvl: 3 });
+          this.dispatch("state", { name_id: "text_sensor/Immich: Server Version", value: ${JSON.stringify(scenario.filterCompatibilityVersion || "3.2.0")} });
+          this.dispatch("state", { id: "text_sensor/Screen: Sunrise", value: "06:30" });
+          this.dispatch("state", { id: "text_sensor/Screen: Sunset", value: "21:45" });
+          this.dispatch("state", { id: "text_sensor/Firmware: Version", value: ${JSON.stringify(installedFirmwareVersion)} });
+          this.dispatch("state", { id: "text_sensor/Firmware: Device", value: ${JSON.stringify(firmwareDeviceSlug)} });
+          this.dispatch("state", { id: "text_sensor/ESP32-C6: Current Firmware", value: "2.0.0" });
+          this.dispatch("state", { id: "text_sensor/ESP32-C6: Available Firmware", value: "2.0.1" });
+          this.dispatch("state", { id: "text_sensor/ESP32-C6: Update Available", value: "Update available" });
+          if (${JSON.stringify(!!scenario.firmwareStaleSseUpdate)}) {
+            setTimeout(() => this.dispatch("state", {
+              id: "update/Firmware: Update",
+              current_version: ${JSON.stringify(installedFirmwareVersion)},
+              latest_version: "",
+              state: ""
+            }), 100);
+          }
+          if (${JSON.stringify(!!scenario.firmwareStaleDeviceMetadata)}) {
+            setTimeout(() => this.dispatch("state", {
+              id: "update/Firmware: Update",
+              current_version: ${JSON.stringify(installedFirmwareVersion)},
+              latest_version: ${JSON.stringify(scenario.firmwareDeviceLatestVersion || "v1.0.1")},
+              state: "UPDATE AVAILABLE"
+            }), 150);
+          }
+        }, 25);
+      }
+      addEventListener(type, listener) {
+        if (!this.listeners[type]) this.listeners[type] = [];
+        this.listeners[type].push(listener);
+      }
+      dispatch(type, data) {
+        (this.listeners[type] || []).forEach((listener) => {
+          listener({ data: JSON.stringify(data) });
+        });
+      }
+      close() {}
+    }
+    window.EventSource = SmokeEventSource;
+
+    const configured = ${JSON.stringify(scenario.configured)};
+    const endpointValues = {
+      "Connection: Server URL": configured ? "https://photos.example.com" : "",
+      "Connection: API Key": configured ? "fixture-api-key" : "",
+      "Firmware: Version": ${JSON.stringify(installedFirmwareVersion)},
+      "Firmware: Device": ${JSON.stringify(firmwareDeviceSlug)},
+      "Photos: Source": "All Photos",
+      "Photos: Memories Window": "Within 2 Days",
+      "Photos: Memories Fallback": true,
+      "Photos: Album IDs": ${JSON.stringify(smokeAlbumIds.join(","))},
+      "Photos: Album Labels": ${JSON.stringify(smokeAlbumLabels.join(","))},
+      "Photos: Person IDs": "22222222-2222-4222-8222-222222222222",
+      "Photos: Person Labels": "Alex",
+      "Photos: Tag IDs": "33333333-3333-4333-8333-333333333333",
+      "Photos: Tag Labels": "Espframe",
+      "Photos: Excluded Album IDs": "",
+      "Photos: Excluded Album Labels": "",
+      "Photos: Excluded Person IDs": "",
+      "Photos: Excluded Person Labels": "",
+      "Photos: Excluded Tag IDs": "",
+      "Photos: Excluded Tag Labels": "",
+      "Photos: Date Filter": true,
+      "Photos: Date Filter Mode": "Fixed Range",
+      "Photos: Date From": "2024-01-01",
+      "Photos: Date To": "2026-06-07",
+      "Photos: Relative Amount": 2,
+      "Photos: Relative Unit": "Years",
+      "Photos: Orientation": "Any",
+      "Photos: Portrait Pairing": true,
+      "Photos: Portrait Pairing Range": "Same Day",
+      "Photos: Paired Portraits Only": false,
+      "Photos: Display Mode": "Fill",
+      "Photos: Slideshow Interval": "15 seconds",
+      "Device: Metadata Date": true,
+      "Device: Metadata Location": true,
+      "Device: Metadata Date Format": "Date Taken",
+      "Device: Metadata Date Taken Format": "1 January, 2026",
+      "Screen: Connection Timeout": "10 minutes",
+      "Clock: Show": true,
+      "Clock: Format": "24 Hour",
+      "Clock: Timezone": "Europe/London (GMT+0)",
+      "Clock: NTP Server 1": "0.pool.ntp.org",
+      "Clock: NTP Server 2": "1.pool.ntp.org",
+      "Clock: NTP Server 3": "2.pool.ntp.org",
+      "Firmware: Auto Update": true,
+      "Firmware: Update Frequency": "Daily",
+      "WiFi Firmware: Auto Update": true,
+      "ESP32-C6: Current Firmware": "2.0.0",
+      "ESP32-C6: Available Firmware": "2.0.1",
+      "ESP32-C6: Update Available": "Update available",
+      "Screen: Daytime Brightness": 100,
+      "Screen: Nighttime Brightness": 75,
+      "Screen: Schedule Enabled": false,
+      "Screen: Schedule On Hour": 6,
+      "Screen: Schedule Off Hour": 23,
+      "Screen: Schedule Wake Timeout": 60,
+      "Screen: Tone Adjustment": false,
+      "Screen: Display Tone": 0,
+      "Screen: Night Tone Adjustment": false,
+      "Screen: Warm Tone Intensity": 50,
+      "Screen: Warm Tone Override": false,
+      "Screen: Rotation": "0",
+      "Developer: Features": false
+    };
+    if (${JSON.stringify(!!scenario.filterCompatibilityVersion)}) {
+      Object.assign(endpointValues, {
+        "Immich: Server Version": ${JSON.stringify(scenario.filterCompatibilityVersion || "3.2.0")},
+        "Photos: Albums Enabled": false,
+        "Photos: People Enabled": true,
+        "Photos: Tags Enabled": false,
+        "Photos: Excluded Album IDs": ${JSON.stringify(smokeAlbumIds[0])},
+        "Photos: Excluded Person IDs": ${JSON.stringify(smokeAlbumIds[0])},
+        "Photos: Excluded Tag IDs": ${JSON.stringify(smokeAlbumIds[0])},
+        "Photos: Person IDs": ${JSON.stringify(smokeAlbumIds.join(","))},
+        "Photos: Inclusion Groups": "Match all enabled groups",
+        "Photos: Person Matching": "Any selected person"
+      });
+    }
+    const configurationKeyByEndpointName = ${JSON.stringify(configurationKeyByEndpointName)};
+    const configurationEndpointNameByKey = Object.fromEntries(
+      Object.entries(configurationKeyByEndpointName).map(([name, key]) => [key, name])
+    );
+
+    function configurationSnapshotValues() {
+      const values = {};
+      Object.entries(configurationEndpointNameByKey).forEach(([key, name]) => {
+        if (key === "api_key") return;
+        if (key === "firmware_device" || key === "firmware") return;
+        if (Object.prototype.hasOwnProperty.call(endpointValues, name)) values[key] = endpointValues[name];
+      });
+      return values;
+    }
+
+    function configurationSnapshot() {
+      return {
+        api_version: 1,
+        api_key_configured: !!String(endpointValues["Connection: API Key"] || ""),
+        values: configurationSnapshotValues(),
+        unavailable: []
+      };
+    }
+
+    function configurationSnapshotForRequest() {
+      if (!${JSON.stringify(!!scenario.legacyConfigurationSnapshot)}) return configurationSnapshot();
+      const snapshot = configurationSnapshot();
+      delete snapshot.api_key_configured;
+      snapshot.values.api_key = endpointValues["Connection: API Key"];
+      return snapshot;
+    }
+
+    function endpointNameForUrl(decoded) {
+      return Object.keys(endpointValues)
+        .sort((left, right) => right.length - left.length)
+        .find((name) => decoded.indexOf(name) !== -1) || "";
+    }
+
+    function requestParam(decoded, body, name) {
+      const queryIndex = decoded.indexOf("?");
+      const query = queryIndex === -1 ? "" : decoded.slice(queryIndex + 1);
+      const params = new URLSearchParams(body || query);
+      return params.get(name);
+    }
+
+    function updateEndpointValueFromPost(decoded, body) {
+      const endpointName = endpointNameForUrl(decoded);
+      if (!endpointName) return;
+      if (decoded.indexOf("/turn_on") !== -1) {
+        endpointValues[endpointName] = true;
+      } else if (decoded.indexOf("/turn_off") !== -1) {
+        endpointValues[endpointName] = false;
+      } else if (decoded.indexOf("/set") !== -1) {
+        const option = requestParam(decoded, body, "option");
+        const value = requestParam(decoded, body, "value");
+        if (option !== null) endpointValues[endpointName] = option;
+        else if (value !== null) endpointValues[endpointName] = value;
+      }
+    }
+
+    let identity = { mac_suffix: "b2c3", name: "", friendly_name: "Espframe", hostname: "immich-frame", ip_address: "192.168.1.42", restart_required: false };
+    if (${JSON.stringify(!!scenario.initialName || !!scenario.delayedIdentity)}) {
+      const name = ${JSON.stringify(scenario.initialName || "Office")};
+      identity = { ...identity, name, friendly_name: name, hostname: name.slice(0, 19).toLowerCase() + "-b2c3" };
+    }
+    let identityFailure = ${JSON.stringify(!!scenario.identityFailure)};
+    window.fetch = function (url, options) {
+      const method = options && options.method ? options.method : "GET";
+      const decoded = decodeURIComponent(String(url));
+      window.__smoke.fetchedUrls.push(decoded);
+      const body = options && options.body != null ? String(options.body) : "";
+      if (decoded === "/espframe/api/v1/identity") {
+        if (method === "GET" && ${JSON.stringify(!!scenario.delayedIdentity)}) {
+          return new Promise(resolve => { window.__smoke.releaseIdentity = () => resolve(
+            ${JSON.stringify(!!scenario.identity)} ? { ok: true, json: () => Promise.resolve({ ...identity }) } : { ok: false, status: 404 }); });
+        }
+        if (!${JSON.stringify(!!scenario.identity)}) return Promise.resolve({ ok: false, status: 404 });
+        if (method === "POST") {
+          window.__smoke.posts.push(decoded);
+          window.__smoke.postRecords.push({ url: decoded, body });
+          if (identityFailure) {
+            identityFailure = false;
+            return Promise.resolve({ ok: false, status: 500 });
+          }
+          const name = new URLSearchParams(body).get("name").trim();
+          identity = { ...identity, name, friendly_name: name || "Espframe",
+            hostname: name ? name.toLowerCase().replace(/[^a-z0-9]+/g, "-") + "-b2c3" : "immich-frame",
+            restart_required: !!name };
+        }
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ ...identity }) });
+      }
+      if (decoded.indexOf("versions.json") !== -1) {
+        if (window.__smoke.firmwareIndexUnavailable) {
+          return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({
+            device: ${JSON.stringify(firmwareDeviceSlug)},
+            versions: [
+              { version: "not-a-version", ota: { path: "bad.ota.bin", md5: "bad" } },
+              { version: ${JSON.stringify(scenario.firmwareIndexLatestVersion || "v1.0.1")}, release_url: "https://github.com/jtenniswood/espframe/releases/tag/v1.0.1", ota: { path: ${JSON.stringify(firmwareDeviceSlug + ".ota.bin")}, md5: "11111111111111111111111111111111" } },
+              { version: "v1.0.1", release_url: "https://github.com/jtenniswood/espframe/releases/tag/v1.0.1", ota: { path: "versions/v1.0.1/${firmwareDeviceSlug}.ota.bin", md5: "44444444444444444444444444444444" } },
+              { version: "v1.0.0", release_url: "https://github.com/jtenniswood/espframe/releases/tag/v1.0.0", ota: { path: "versions/v1.0.0/${firmwareDeviceSlug}.ota.bin", md5: "22222222222222222222222222222222" } },
+              { version: "v0.9.0", release_url: "https://github.com/jtenniswood/espframe/releases/tag/v0.9.0", ota: { path: "versions/v0.9.0/${firmwareDeviceSlug}.ota.bin", md5: "33333333333333333333333333333333" } }
+            ]
+          })
+        });
+      }
+      if (decoded.indexOf("manifest.json") !== -1) {
+        if (window.__smoke.firmwareManifestUnavailable) {
+          return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({
+            version: ${JSON.stringify(scenario.firmwareManifestVersion || "v1.0.1")},
+            builds: [{ ota: { path: ${JSON.stringify(firmwareDeviceSlug + ".ota.bin")}, md5: "11111111111111111111111111111111" } }]
+          })
+        });
+      }
+      if (decoded.indexOf(".ota.bin") !== -1 && method === "GET") {
+        return Promise.resolve({ ok: true, status: 200, blob: () => Promise.resolve(new Blob(["firmware"])) });
+      }
+      if (decoded === "/update" && method === "POST") {
+        window.__smoke.posts.push(decoded);
+        window.__smoke.postRecords.push({ url: decoded, body });
+        return Promise.resolve({
+          ok: !window.__smoke.firmwareUploadFails,
+          status: window.__smoke.firmwareUploadFails ? 500 : 200,
+          text: () => Promise.resolve(window.__smoke.firmwareUploadFails ? "Update failed" : "Update successful")
+        });
+      }
+      if (decoded === "/espframe/api/v1/configuration") {
+        if (${JSON.stringify(!!scenario.legacyApi)}) {
+          return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+        }
+        if (method === "GET") {
+          if (${JSON.stringify(!!scenario.legacyStartup)}) {
+            return Promise.resolve({ ok: false, status: 404 });
+          }
+          if (${JSON.stringify(!!scenario.slowStartup)}) {
+            return new Promise(resolve => setTimeout(() => resolve({
+              ok: true, status: 200,
+              json: () => Promise.resolve(configurationSnapshotForRequest())
+            }), ${Number(scenario.startupDelayMs || 900)}));
+          }
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: () => Promise.resolve(configurationSnapshotForRequest())
+          });
+        }
+        if (window.__smoke.configurationUpdateInFlight) {
+          return Promise.resolve({
+            ok: false,
+            status: 409,
+            json: () => Promise.resolve({ api_version: 1, status: "rejected", error: "update_in_progress" })
+          });
+        }
+        window.__smoke.configurationUpdateInFlight = true;
+        const encoded = new URLSearchParams(body).get("configuration");
+        const update = encoded ? JSON.parse(encoded) : { values: {} };
+        const failedKey = configurationKeyByEndpointName[window.__smoke.failedPostEndpoint];
+        if (failedKey && Object.prototype.hasOwnProperty.call(update.values, failedKey)) {
+          window.__smoke.posts.push(decoded);
+          window.__smoke.postRecords.push({ url: decoded, body });
+          return new Promise((resolve) => setTimeout(() => {
+            window.__smoke.configurationUpdateInFlight = false;
+            resolve({
+              ok: false,
+              status: 422,
+              json: () => Promise.resolve({ api_version: 1, status: "rejected", error: "smoke_failure", field: failedKey })
+            });
+          }, 0));
+        }
+        window.__smoke.posts.push(decoded);
+        window.__smoke.postRecords.push({ url: decoded, body });
+        return new Promise((resolve) => setTimeout(() => {
+          Object.entries(update.values || {}).forEach(([key, value]) => {
+            const endpointName = configurationEndpointNameByKey[key];
+            if (endpointName) endpointValues[endpointName] = value;
+          });
+          window.__smoke.configurationUpdateInFlight = false;
+          resolve({
+            ok: true,
+            status: 200,
+            json: () => Promise.resolve({ api_version: 1, status: "accepted", updated: Object.keys(update.values || {}).length })
+          });
+        }, 0));
+      }
+      if (method === "POST") {
+        window.__smoke.posts.push(decoded);
+        window.__smoke.postRecords.push({ url: decoded, body });
+        if (window.__smoke.failedPostEndpoint && decoded.indexOf(window.__smoke.failedPostEndpoint) !== -1) {
+          return Promise.resolve({ ok: false, status: 500, json: () => Promise.resolve({}) });
+        }
+        updateEndpointValueFromPost(decoded, body);
+      }
+      if (decoded.indexOf("Firmware: Update") !== -1) {
+        if (method === "POST" && decoded.indexOf("/install") !== -1 && window.__smoke.firmwareDeviceInstallFails) {
+          return Promise.resolve({ ok: false, status: 500, json: () => Promise.resolve({}) });
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ value: ${JSON.stringify(scenario.firmwareDeviceLatestVersion || "v1.0.1")}, state: "UPDATE AVAILABLE", current_version: ${JSON.stringify(installedFirmwareVersion)}, latest_version: ${JSON.stringify(scenario.firmwareDeviceLatestVersion || "v1.0.1")} })
+        });
+      }
+      if (decoded === "/espframe/api/v1/capabilities") {
+        if (${JSON.stringify(!!scenario.legacyApi)}) {
+          return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+        }
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({
+          contract_version: 2, api_version: 1, base_path: "/espframe/api/v1",
+          capabilities_path: "/espframe/api/v1/capabilities",
+          configuration_path: "/espframe/api/v1/configuration", update_mode: "atomic",
+          configuration_available: true, configuration_read: true, configuration_write: true,
+          configuration_encoding: "application/x-www-form-urlencoded", configuration_parameter: "configuration",
+          legacy_entity_api: true, backup_versions: [1, 2, 3], setting_count: 52
+        }) });
+      }
+      const endpointName = endpointNameForUrl(decoded);
+      const value = endpointName ? endpointValues[endpointName] : "";
+      const state = value === true ? "ON" : value === false ? "OFF" : String(value);
+      if (${JSON.stringify(!!scenario.legacyStartup)} && method === "GET") {
+        return new Promise(resolve => setTimeout(() => resolve({
+          ok: true, status: 200, json: () => Promise.resolve({ value, state, option: [] })
+        }), 900));
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ value, state, option: [] })
+      });
+    };
+  `;
+}
+
+function smokeAssertionsForScenario(scenario) {
+  const expectedLatestFirmwareVersion = scenario.firmwareManifestVersion || scenario.firmwareIndexLatestVersion || "v1.0.1";
+  const expectedPreviousFirmwareVersions = scenario.installedFirmwareVersion === "dev"
+    ? ["v1.0.1", "v1.0.0", "v0.9.0"]
+    : expectedLatestFirmwareVersion === "v1.0.2" ? ["v1.0.1", "v0.9.0"] : ["v0.9.0"];
+  const expectedFirmwareVersionsPath = scenario.firmwareDeviceSlug
+    ? String(product.devices.find((device) => device.slug === scenario.firmwareDeviceSlug).public_manifest)
+        .replace(/[^/]+$/, "versions.json")
+    : "";
+  return `
+    (async function () {
+      function waitFor(check, timeoutMs, label) {
+        const started = Date.now();
+        return new Promise((resolve, reject) => {
+          function poll() {
+            try {
+              if (check()) return resolve();
+            } catch (error) {
+              return reject(error);
+            }
+            if (Date.now() - started > timeoutMs) return reject(new Error("Timed out waiting for " + label + (window.__smoke.lastAssertion || "")));
+            setTimeout(poll, 50);
+          }
+          poll();
+        });
+      }
+      function pageText() {
+        return document.body.innerText || "";
+      }
+      function requireText(text) {
+        if (pageText().indexOf(text) === -1) throw new Error("Missing text: " + text);
+      }
+      function buttonByText(text) {
+        return Array.from(document.querySelectorAll("button")).find((button) => button.textContent.trim() === text);
+      }
+      function clickButton(text) {
+        const button = buttonByText(text);
+        if (!button) throw new Error("Button not found: " + text);
+        button.click();
+        return button;
+      }
+      function clickTab(text) {
+        const tab = Array.from(document.querySelectorAll(".sp-tab")).find((item) => item.textContent.trim() === text);
+        if (!tab) throw new Error("Tab not found: " + text);
+        tab.click();
+        return tab;
+      }
+      function requirePostContains(label, fragment, extraFragment) {
+        const configured = latestConfigurationValue(fragment);
+        if (configured.found) {
+          let matches = true;
+          if (extraFragment === "turn_on") matches = configured.value === true;
+          else if (extraFragment === "turn_off") matches = configured.value === false;
+          else if (extraFragment && extraFragment.indexOf("option=") === 0) matches = String(configured.value) === extraFragment.slice(7);
+          else if (extraFragment && extraFragment.indexOf("value=") === 0) matches = String(configured.value) === extraFragment.slice(6);
+          if (matches) return;
+        }
+        const found = window.__smoke.posts.some((url) =>
+          url.indexOf(fragment) !== -1 && (!extraFragment || url.indexOf(extraFragment) !== -1)
+        );
+        if (!found) throw new Error(label + " was not posted to the device");
+      }
+      function configurationUpdates() {
+        return window.__smoke.postRecords.map((record) => {
+          if (record.url !== "/espframe/api/v1/configuration") return null;
+          const encoded = new URLSearchParams(record.body).get("configuration");
+          return encoded ? JSON.parse(encoded).values : null;
+        }).filter(Boolean);
+      }
+      function latestConfigurationValue(fragment) {
+        const endpoint = Object.prototype.hasOwnProperty.call(configurationKeyByEndpointName, fragment)
+          ? fragment : Object.keys(configurationKeyByEndpointName).find((name) => name.indexOf(fragment) !== -1);
+        const key = endpoint && configurationKeyByEndpointName[endpoint];
+        if (!key) return { found: false };
+        const updates = configurationUpdates();
+        for (let i = updates.length - 1; i >= 0; i--) {
+          if (Object.prototype.hasOwnProperty.call(updates[i], key)) return { found: true, value: updates[i][key] };
+        }
+        return { found: false };
+      }
+      function hasConfigurationPost(fragment) {
+        return latestConfigurationValue(fragment).found;
+      }
+      function latestPostRecord(fragment) {
+        for (let i = window.__smoke.postRecords.length - 1; i >= 0; i--) {
+          const record = window.__smoke.postRecords[i];
+          if (record.url.indexOf(fragment) !== -1) return record;
+        }
+        throw new Error("POST record not found: " + fragment);
+      }
+      function postRecordParam(record, name) {
+        const queryIndex = record.url.indexOf("?");
+        const query = queryIndex === -1 ? "" : record.url.slice(queryIndex + 1);
+        const params = new URLSearchParams(record.body || query);
+        return params.get(name);
+      }
+      function requireLatestPostValue(label, fragment, expected) {
+        const configured = latestConfigurationValue(fragment);
+        const actual = configured.found ? String(configured.value) : postRecordParam(latestPostRecord(fragment), "value");
+        if (actual !== expected) {
+          throw new Error(label + " saved " + JSON.stringify(actual) + " instead of " + JSON.stringify(expected));
+        }
+      }
+      function requireLatestPostParam(label, fragment, param, expected) {
+        const configured = latestConfigurationValue(fragment);
+        const actual = configured.found ? String(configured.value) : postRecordParam(latestPostRecord(fragment), param);
+        if (actual !== expected) {
+          throw new Error(label + " saved " + JSON.stringify(actual) + " instead of " + JSON.stringify(expected));
+        }
+      }
+      function requireExportShape() {
+        if (!window.__smoke.exportPayloads.length) throw new Error("Export payload was not captured");
+        const exported = JSON.parse(window.__smoke.exportPayloads[0]);
+        if (exported.version !== ${JSON.stringify(product.project.backup_config_version)}) {
+          throw new Error("Exported backup version changed");
+        }
+        if (!exported.exported_at || typeof exported.exported_at !== "string") {
+          throw new Error("Exported backup timestamp missing");
+        }
+        const expectedGroups = ${JSON.stringify(expectedBackupGroups)};
+        const expectedFields = ${JSON.stringify(expectedBackupFields)};
+        const actualGroups = Object.keys(exported).filter((key) => key !== "version" && key !== "exported_at");
+        if (JSON.stringify(actualGroups) !== JSON.stringify(expectedGroups)) {
+          throw new Error("Exported backup groups changed: " + JSON.stringify(actualGroups));
+        }
+        expectedGroups.forEach((group) => {
+          const actualFields = Object.keys(exported[group] || {});
+          const expectedGroupFields = expectedFields[group] || [];
+          if (JSON.stringify(actualFields) !== JSON.stringify(expectedGroupFields)) {
+            throw new Error("Exported backup fields changed for " + group + ": " + JSON.stringify(actualFields));
+          }
+        });
+        if (!Array.isArray(exported.clock.ntp_servers) || exported.clock.ntp_servers.length !== 3) {
+          throw new Error("Exported NTP servers must remain a three-item array");
+        }
+        if (exported.screen.schedule_wake_timeout !== 60) {
+          throw new Error("Exported schedule wake timeout was not normalized");
+        }
+      }
+      function selectByLabel(labelText) {
+        const labels = Array.from(document.querySelectorAll("label"));
+        const label = labels.find((item) => item.textContent.trim() === labelText);
+        if (!label || !label.parentElement) throw new Error("Field not found: " + labelText);
+        const select = label.parentElement.querySelector("select");
+        if (!select) throw new Error("Select not found for field: " + labelText);
+        return select;
+      }
+      function setSelect(labelText, value) {
+        const select = selectByLabel(labelText);
+        select.value = value;
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      function requireSelectIncludes(labelText, values) {
+        const select = selectByLabel(labelText);
+        values.forEach((value) => {
+          if (!Array.from(select.options).some((option) => option.value === value)) {
+            throw new Error(labelText + " is missing option: " + value);
+          }
+        });
+      }
+      function requireSelectExcludes(labelText, values) {
+        const select = selectByLabel(labelText);
+        values.forEach((value) => {
+          if (Array.from(select.options).some((option) => option.value === value)) {
+            throw new Error(labelText + " should not include option: " + value);
+          }
+        });
+      }
+      function requireSelectDisabled(labelText) {
+        if (!selectByLabel(labelText).disabled) throw new Error(labelText + " should be disabled");
+      }
+      function requireToggleDisabled(labelText) {
+        const toggle = toggleByText(labelText);
+        if (toggle.style.cursor !== "not-allowed") throw new Error(labelText + " should be disabled");
+      }
+      function fieldByLabel(labelText) {
+        const labels = Array.from(document.querySelectorAll("label"));
+        const label = labels.find((item) => item.textContent.trim() === labelText);
+        if (!label || !label.parentElement) throw new Error("Field not found: " + labelText);
+        return label.parentElement;
+      }
+      function cardByTitle(title) {
+        const card = Array.from(document.querySelectorAll(".card")).find((item) => {
+          const heading = item.querySelector("h3");
+          return heading && heading.textContent.trim() === title;
+        });
+        if (!card) throw new Error("Card not found: " + title);
+        return card;
+      }
+      function expandCard(title) {
+        const card = cardByTitle(title);
+        if (card.classList.contains("collapsed")) {
+          const header = card.querySelector(".card-header");
+          if (!header) throw new Error("Card header not found: " + title);
+          header.click();
+        }
+        return card;
+      }
+      function requireSettingsSections() {
+        clickTab("Device");
+        const expected = [
+          ["Display", ["Screen Brightness", "Screen Tone", "Rotation", "Clock"]],
+          ["Sleep & Schedule", ["Night Schedule"]],
+          ["System", ["Backup", "Firmware", "Device Reboot"]]
+        ];
+        const sections = Array.from(document.querySelectorAll("#sp-settings .settings-section"));
+        const sectionNames = sections.map((section) => {
+          const heading = section.querySelector(":scope > .settings-section-title");
+          if (!heading || heading.tagName !== "H2" || section.getAttribute("aria-labelledby") !== heading.id) {
+            throw new Error("Settings section is missing its accessible heading");
+          }
+          return heading.textContent.trim();
+        });
+        if (sectionNames.join("|") !== expected.map((entry) => entry[0]).join("|")) {
+          throw new Error("Unexpected settings section order: " + sectionNames.join(", "));
+        }
+        expected.forEach(([name, expectedCards]) => {
+          const section = sections.find((item) => item.querySelector(":scope > .settings-section-title").textContent.trim() === name);
+          const cardNames = Array.from(section.querySelectorAll(":scope > .card > .card-header > h3"))
+            .map((heading) => heading.textContent.trim());
+          if (cardNames.join("|") !== expectedCards.join("|")) {
+            throw new Error(name + " cards are not logically ordered: " + cardNames.join(", "));
+          }
+        });
+      }
+      function disclosureByTitle(title) {
+        const disclosure = Array.from(document.querySelectorAll(".inline-disclosure")).find((item) => {
+          const button = item.querySelector(".inline-disclosure-button");
+          return button && button.textContent.indexOf(title) !== -1;
+        });
+        if (!disclosure) throw new Error("Firmware panel not found: " + title);
+        return disclosure;
+      }
+      function expandDisclosure(title) {
+        const disclosure = disclosureByTitle(title);
+        const button = disclosure.querySelector(".inline-disclosure-button");
+        if (button.getAttribute("aria-expanded") !== "true") button.click();
+        if (button.getAttribute("aria-expanded") !== "true") throw new Error(title + " did not expand");
+        return disclosure;
+      }
+      function toggleInDisclosure(title, label) {
+        const disclosure = expandDisclosure(title);
+        const row = Array.from(disclosure.querySelectorAll(".toggle-row")).find((item) =>
+          Array.from(item.querySelectorAll("span")).some((span) => span.textContent.trim() === label)
+        );
+        const toggle = row && row.querySelector(".toggle");
+        if (!toggle) throw new Error("Toggle not found in " + title + ": " + label);
+        return toggle;
+      }
+      async function requireFirmwarePanels() {
+        const card = expandCard("Firmware");
+        await waitFor(() => card.textContent.indexOf(${JSON.stringify(expectedLatestFirmwareVersion)}) !== -1, 4000, "firmware version index");
+        ["Firmware updates", "Auto updates", "WiFi firmware", "Previous firmware"].forEach((title) => {
+          const button = disclosureByTitle(title).querySelector(".inline-disclosure-button");
+          if (button.tagName !== "BUTTON" || button.getAttribute("aria-expanded") !== "false") {
+            throw new Error(title + " disclosure is not an accessible collapsed button");
+          }
+        });
+        if (!card.querySelector(".on-badge.active")) throw new Error("Outer firmware update badge is not active");
+        const updates = expandDisclosure("Firmware updates");
+        if (updates.textContent.indexOf("Current version") === -1 || updates.textContent.toLowerCase().indexOf(${JSON.stringify((scenario.installedFirmwareVersion || "v1.0.0").toLowerCase())}) === -1) {
+          throw new Error("Current firmware version is missing");
+        }
+        if (updates.textContent.indexOf("Available version") === -1 || updates.textContent.indexOf(${JSON.stringify(expectedLatestFirmwareVersion)}) === -1) {
+          throw new Error("Available firmware version is missing");
+        }
+        if (!disclosureByTitle("Firmware updates").querySelector(".disclosure-badge.active")) {
+          throw new Error("Main firmware update badge does not match the installed version");
+        }
+        if (!disclosureByTitle("Auto updates").querySelector(".disclosure-badge.active")) {
+          throw new Error("Automatic update badge is not active");
+        }
+        const wifi = expandDisclosure("WiFi firmware");
+        if (wifi.textContent.indexOf("2.0.0") === -1 || wifi.textContent.indexOf("2.0.1") === -1) {
+          throw new Error("WiFi firmware versions are missing");
+        }
+        if (!wifi.querySelector(".disclosure-badge.active")) throw new Error("WiFi update badge is not active");
+        const previous = expandDisclosure("Previous firmware");
+        const versions = Array.from(previous.querySelectorAll("option")).map((option) => option.value);
+        if (JSON.stringify(versions) !== JSON.stringify(${JSON.stringify(expectedPreviousFirmwareVersions)})) {
+          throw new Error("Rollback choices are wrong: " + JSON.stringify(versions));
+        }
+      }
+      function setRangeByLabel(labelText, value) {
+        const inputEl = fieldByLabel(labelText).querySelector('input[type="range"]');
+        if (!inputEl) throw new Error("Range input not found for field: " + labelText);
+        inputEl.value = String(value);
+        inputEl.dispatchEvent(new Event("input", { bubbles: true }));
+        inputEl.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      function setCardRange(cardTitle, index, value) {
+        const inputs = Array.from(expandCard(cardTitle).querySelectorAll('input[type="range"]'));
+        const inputEl = inputs[index];
+        if (!inputEl) throw new Error("Range input " + index + " not found in card: " + cardTitle);
+        inputEl.value = String(value);
+        inputEl.dispatchEvent(new Event("input", { bubbles: true }));
+        inputEl.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      function inputByLabel(labelText) {
+        const inputEl = fieldByLabel(labelText).querySelector("input");
+        if (!inputEl) throw new Error("Input not found for field: " + labelText);
+        return inputEl;
+      }
+      function setInputByLabel(labelText, value) {
+        const inputEl = inputByLabel(labelText);
+        inputEl.value = value;
+        inputEl.dispatchEvent(new Event("input", { bubbles: true }));
+        inputEl.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      function inputByAriaLabel(labelText) {
+        const inputEl = document.querySelector('input[aria-label="' + labelText + '"]');
+        if (!inputEl) throw new Error("Input not found: " + labelText);
+        return inputEl;
+      }
+      function setInputByAriaLabel(labelText, value) {
+        const inputEl = inputByAriaLabel(labelText);
+        inputEl.value = value;
+        inputEl.dispatchEvent(new Event("input", { bubbles: true }));
+        inputEl.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      function toggleByText(text) {
+        const row = Array.from(document.querySelectorAll(".toggle-row")).find((item) =>
+          Array.from(item.querySelectorAll("span")).some((span) => span.textContent.trim() === text)
+        );
+        if (!row) throw new Error("Toggle not found: " + text);
+        const toggle = row.querySelector(".toggle");
+        if (!toggle) throw new Error("Toggle control not found: " + text);
+        return toggle;
+      }
+      function photoRows(labelText) {
+        return Array.from(fieldByLabel(labelText).querySelectorAll(".photo-id-row"));
+      }
+      function photoRowValues(labelText) {
+        return photoRows(labelText).map((row) =>
+          Array.from(row.querySelectorAll("input")).map((inputEl) => inputEl.value)
+        );
+      }
+      async function requireAlbumReorderSave() {
+        const startingIds = ${JSON.stringify(smokeAlbumIds)};
+        const startingLabels = ${JSON.stringify(smokeAlbumLabels)};
+        const expectedIds = startingIds.slice().reverse().join(",");
+        const expectedLabels = JSON.stringify(startingLabels.slice().reverse());
+
+        toggleByText("Filter by Albums").click();
+        await waitFor(() => photoRows("Selected Albums").length === 2, 3000, "album rows");
+
+        const before = photoRowValues("Selected Albums");
+        if (JSON.stringify(before.map((row) => row[0])) !== JSON.stringify(startingIds)) {
+          throw new Error("Unexpected starting album ID order: " + JSON.stringify(before));
+        }
+        if (JSON.stringify(before.map((row) => row[1])) !== JSON.stringify(startingLabels)) {
+          throw new Error("Unexpected starting album label order: " + JSON.stringify(before));
+        }
+
+        const moveUp = photoRows("Selected Albums")[1].querySelector('[aria-label="Move up"]');
+        if (!moveUp || moveUp.disabled) throw new Error("Second album row cannot move up");
+        moveUp.click();
+
+        await waitFor(() => {
+          const values = photoRowValues("Selected Albums");
+          return values[0] && values[0][0] === startingIds[1] && values[0][1] === startingLabels[1];
+        }, 3000, "album row visual reorder");
+
+        await waitFor(() => {
+          try {
+            requireLatestPostValue("Album IDs", "Photos: Album IDs", expectedIds);
+            requireLatestPostValue("Album labels", "Photos: Album Labels", expectedLabels);
+            return window.__smoke.posts.some((url) => url.indexOf("Apply Photo Source") !== -1);
+          } catch (_) {
+            return false;
+          }
+        }, 8000, "album reorder save");
+      }
+      function requireIncludedPanel(groupLabel, selectedLabel, expectHint) {
+        const group = fieldByLabel(selectedLabel).closest(".filter-group-details");
+        if (!group) throw new Error(groupLabel + " filter group not found");
+        const included = Array.from(group.querySelectorAll("details")).find((item) =>
+          item.querySelector("summary") &&
+          item.querySelector("summary").textContent.trim() === "Included " + groupLabel
+        );
+        if (!included || included.open || !included.querySelector("label")) {
+          throw new Error(groupLabel + " should group selected items inside a closed Included panel by default");
+        }
+        included.open = true;
+        if (parseFloat(getComputedStyle(group).paddingBottom) < 16) {
+          throw new Error(groupLabel + " filter group should have extra bottom spacing");
+        }
+        included.open = false;
+        const closedPanelStyle = getComputedStyle(included);
+        const closedSummaryStyle = getComputedStyle(included.querySelector("summary"));
+        if (parseFloat(closedPanelStyle.paddingTop) > 4 || parseFloat(closedPanelStyle.paddingBottom) > 4 ||
+            parseFloat(closedSummaryStyle.minHeight) > 40 || closedSummaryStyle.alignItems !== "center") {
+          throw new Error(groupLabel + " panel should be compact with a centered closed label");
+        }
+        included.open = true;
+        const hint = included.querySelector(".setting-hint");
+        if ((expectHint && !hint) || (!expectHint && hint) || !included.querySelector("button")) {
+          throw new Error("Included " + groupLabel + " panel should contain its hint and controls");
+        }
+        const chevron = getComputedStyle(included.querySelector("summary"), "::before");
+        if (chevron.borderRightWidth === "0px" || chevron.borderBottomWidth === "0px") {
+          throw new Error("Included " + groupLabel + " panel should use a chevron disclosure icon");
+        }
+      }
+      function requireAlbumOrderAfterExclusions() {
+        const group = fieldByLabel("Selected Albums").closest(".filter-group-details");
+        const excluded = group && group.querySelector("details.filter-exclusions");
+        const order = fieldByLabel("Album Order");
+        if (!excluded || !order || !(excluded.compareDocumentPosition(order) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+          throw new Error("Album Order should appear below Excluded Albums");
+        }
+      }
+      function requireNoAdvancedInclusionPanel() {
+        const advanced = Array.from(document.querySelectorAll("details.filter-nested")).find((item) =>
+          item.querySelector("summary") && item.querySelector("summary").textContent.trim() === "Advanced inclusion options"
+        );
+        if (advanced) {
+          throw new Error("Advanced inclusion options should not render");
+        }
+      }
+      async function requireScreenRotationDeveloperFlow() {
+        clickTab("Device");
+        await waitFor(() => pageText().indexOf("Rotation") !== -1, 8000, "device settings");
+        requireText("Screen Brightness");
+        expandCard("Developer");
+        requireText("Enable in-development features");
+
+        requireSelectIncludes("Rotation", ["0", "180"]);
+        requireSelectExcludes("Rotation", ["90", "270"]);
+
+        toggleByText("Enable in-development features").click();
+        await waitFor(() => {
+          try {
+            requirePostContains("Developer features enable", "Developer: Features", "turn_on");
+            requireSelectIncludes("Rotation", ["0", "90", "180", "270"]);
+            return true;
+          } catch (_) {
+            return false;
+          }
+        }, 8000, "developer rotation options");
+
+        setSelect("Rotation", "90");
+        await waitFor(() => {
+          try {
+            requireLatestPostParam("Portrait rotation", "Screen: Rotation", "option", "90");
+            requirePostContains("Portrait pairing disabled", "Photos: Portrait Pairing", "turn_off");
+            return true;
+          } catch (_) {
+            return false;
+          }
+        }, 8000, "portrait rotation save");
+
+        toggleByText("Enable in-development features").click();
+        await waitFor(() => {
+          try {
+            requirePostContains("Developer features disable", "Developer: Features", "turn_off");
+            requireLatestPostParam("Rotation reset", "Screen: Rotation", "option", "0");
+            requireSelectIncludes("Rotation", ["0", "180"]);
+            requireSelectExcludes("Rotation", ["90", "270"]);
+            return true;
+          } catch (_) {
+            return false;
+          }
+        }, 8000, "developer rotation reset");
+      }
+      async function requireScreenToneScheduleControls() {
+        clickTab("Device");
+        await waitFor(() => pageText().indexOf("Night Schedule") !== -1, 8000, "device screen controls");
+        requireText("Screen Brightness");
+        requireText("Screen Tone");
+        requireText("Night Schedule");
+        expandCard("Screen Tone");
+        expandCard("Night Schedule");
+        requireText("Screen Tone Adjustment");
+        requireText("Night Tone Adjustment");
+        requireText("Schedule Screen Off");
+
+        expandCard("Screen Brightness");
+        setRangeByLabel("Daytime Brightness", 85);
+        setRangeByLabel("Nighttime Brightness", 55);
+
+        expandCard("Screen Tone");
+        toggleByText("Screen Tone Adjustment").click();
+        setCardRange("Screen Tone", 0, 25);
+        toggleByText("Night Tone Adjustment").click();
+        setCardRange("Screen Tone", 1, 65);
+        toggleByText("Turn on until sunrise").click();
+
+        expandCard("Night Schedule");
+        toggleByText("Schedule Screen Off").click();
+        setSelect("On Time", "7");
+        setSelect("Off Time", "21");
+        setSelect("When Woken, Idle Time To Screen Off", "120");
+
+        await waitFor(() => {
+          try {
+            requireLatestPostValue("Daytime brightness", "Screen: Daytime Brightness", "85");
+            requireLatestPostValue("Nighttime brightness", "Screen: Nighttime Brightness", "55");
+            requirePostContains("Base tone toggle", "Screen: Tone Adjustment", "turn_on");
+            requireLatestPostValue("Base tone", "Screen: Display Tone", "25");
+            requirePostContains("Night tone toggle", "Screen: Night Tone Adjustment", "turn_on");
+            requireLatestPostValue("Night tone intensity", "Screen: Warm Tone Intensity", "65");
+            requirePostContains("Warm tone override", "Screen: Warm Tone Override", "turn_on");
+            requirePostContains("Schedule toggle", "Screen: Schedule Enabled", "turn_on");
+            requireLatestPostValue("Schedule on hour", "Screen: Schedule On Hour", "7");
+            requireLatestPostValue("Schedule off hour", "Screen: Schedule Off Hour", "21");
+            requireLatestPostValue("Schedule wake timeout", "Screen: Schedule Wake Timeout", "120");
+            return true;
+          } catch (_) {
+            return false;
+          }
+        }, 8000, "screen tone and schedule saves");
+      }
+      async function requireDailySettingsControls() {
+        expandCard("Connection");
+        expandCard("Frequency");
+        const portraitPairingCard = cardByTitle("Portrait Pairing");
+        if (!portraitPairingCard.classList.contains("collapsed")) {
+          throw new Error("Portrait pairing should be closed by default");
+        }
+        const initialPortraitPairingBadge = portraitPairingCard.querySelector(".card-header .on-badge");
+        if (!initialPortraitPairingBadge || getComputedStyle(initialPortraitPairingBadge).display === "none") {
+          throw new Error("Portrait pairing ON badge should be visible while the card is closed");
+        }
+        expandCard("Portrait Pairing");
+        const filtersCard = expandCard("Filters");
+        const filterBadge = filtersCard.querySelector(".on-badge");
+        if (!filterBadge || getComputedStyle(filterBadge).display !== "none") {
+          throw new Error("Filters badge must be hidden while open");
+        }
+        const filterToggles = Array.from(filtersCard.querySelectorAll('[role="switch"]'));
+        const initialFilterStates = filterToggles.map((toggle) => toggle.getAttribute("aria-checked") === "true");
+        filterToggles.forEach((toggle) => {
+          if (toggle.getAttribute("aria-checked") === "true") toggle.click();
+        });
+        filtersCard.querySelector(".card-header").click();
+        if (getComputedStyle(filterBadge).display !== "none") throw new Error("All filters off must hide badge");
+        filterToggles.forEach((toggle) => {
+          toggle.click();
+          if (getComputedStyle(filterBadge).display === "none") {
+            throw new Error("Each enabled photo filter must show the collapsed ON badge");
+          }
+          toggle.click();
+          if (getComputedStyle(filterBadge).display !== "none") throw new Error("Last filter off must hide badge");
+        });
+        filterToggles.forEach((toggle, index) => { if (initialFilterStates[index]) toggle.click(); });
+        expandCard("Filters");
+        expandCard("Photo Display");
+        expandCard("Metadata");
+
+        const immichCardTitles = Array.from(document.querySelectorAll("#sp-immich .card .card-header h3"))
+          .map((item) => item.textContent.trim());
+        if (immichCardTitles.indexOf("Portrait Pairing") !== immichCardTitles.indexOf("Frequency") + 1) {
+          throw new Error("Portrait Pairing should appear directly below Frequency");
+        }
+        if (immichCardTitles.indexOf("Memories") !== immichCardTitles.indexOf("Portrait Pairing") + 1 ||
+            immichCardTitles.indexOf("Filters") !== immichCardTitles.indexOf("Memories") + 1) {
+          throw new Error("Memories and Filters should follow Portrait Pairing in order");
+        }
+        if (immichCardTitles.indexOf("Advanced Filters") !== -1) {
+          throw new Error("Advanced Filters should not render as a standalone card");
+        }
+        const firstPhotoFilterToggle = Array.from(filtersCard.querySelectorAll(".card-body .toggle-row > span"))
+          .find((item) => item.textContent.trim() === "Filter by Date");
+        if (!firstPhotoFilterToggle || firstPhotoFilterToggle.textContent.trim() !== "Filter by Date") {
+          throw new Error("Date filter should appear at the top of Filters");
+        }
+        const dateFilterRow = firstPhotoFilterToggle.closest(".field");
+        const dateFilterGroup = dateFilterRow && dateFilterRow.nextElementSibling;
+        if (!dateFilterRow || dateFilterRow.closest(".filter-group-details") ||
+            !dateFilterGroup || !dateFilterGroup.classList.contains("filter-group-details") ||
+            parseFloat(getComputedStyle(dateFilterGroup).paddingBottom) < 16) {
+          throw new Error("Date filter should use the shared filter group styling");
+        }
+        requireText("Connection Timeout");
+        requireText("Slideshow Interval");
+        requireText("Portrait Pairing");
+        requireText("Pairing Range");
+        requireText("Show Paired Portraits Only");
+        expandCard("Photo Display");
+        expandCard("Metadata");
+        requireText("Display Photos");
+        requireText("Display Mode");
+        const displayModeOptions = Array.from(selectByLabel("Display Mode").options).map((option) => option.textContent);
+        if (displayModeOptions.join("|") !== "Crop to fit|Show full image") {
+          throw new Error("Display Mode labels are incorrect: " + displayModeOptions.join(", "));
+        }
+        if (portraitPairingCard.querySelector(".card-header .toggle")) {
+          throw new Error("Portrait pairing should not have a header toggle");
+        }
+        const portraitPairingBadge = portraitPairingCard.querySelector(".card-header .on-badge");
+        if (!portraitPairingBadge || getComputedStyle(portraitPairingBadge).display !== "none") {
+          throw new Error("Portrait pairing ON badge should be hidden while the card is open");
+        }
+        const portraitPairingFields = Array.from(portraitPairingCard.querySelectorAll("label, .toggle-row > span"))
+          .map((item) => item.textContent.trim())
+          .filter(Boolean);
+        if (portraitPairingFields.indexOf("Show Paired Portraits Only") > portraitPairingFields.indexOf("Pairing Range")) {
+          throw new Error("Portrait pairing settings are in the wrong order");
+        }
+        requireText("Metadata");
+
+        setSelect("Connection Timeout", "5 minutes");
+        setSelect("Slideshow Interval", "24 hours");
+        setSelect("Pairing Range", "Within 2 Days");
+        toggleByText("Show Paired Portraits Only").click();
+        cardByTitle("Portrait Pairing").querySelector(".card-body .toggle").click();
+        setSelect("Display Photos", "Landscape Only");
+        setSelect("Display Mode", "Fit");
+        setSelect("Date Taken Format", "January 1, 2026");
+        setSelect("Date Format", "Relative Date");
+        toggleByText("Location").click();
+        toggleByText("Date").click();
+
+        const initialMemoriesCard = cardByTitle("Memories");
+        if (!initialMemoriesCard.classList.contains("collapsed")) {
+          throw new Error("Memories should be closed by default");
+        }
+        const initialMemoriesBadge = initialMemoriesCard.querySelector(".card-header .on-badge");
+        if (!initialMemoriesBadge || getComputedStyle(initialMemoriesBadge).display !== "none") {
+          throw new Error("Memories ON badge should be hidden while Memories is disabled");
+        }
+        const memoriesCard = expandCard("Memories");
+        const memoriesToggle = toggleByText("Show Memories Only");
+        const memoriesBody = memoriesCard.querySelector(".card-body");
+        const memoriesBanner = memoriesBody.querySelector(".setting-info-banner");
+        const memoriesToggleField = memoriesToggle.closest(".field");
+        if (!memoriesBanner || !memoriesToggleField || memoriesBanner.nextElementSibling !== memoriesToggleField) {
+          throw new Error("Memories info banner should appear above the Memories toggle");
+        }
+        const memoriesWindowField = fieldByLabel("Memories Window");
+        const memoriesFallbackField = toggleByText("Fallback to All Photos").closest(".field");
+        if (getComputedStyle(memoriesWindowField).display !== "none" ||
+            getComputedStyle(memoriesFallbackField).display !== "none") {
+          throw new Error("Memories secondary options should be hidden while disabled");
+        }
+        const memoriesWindowOptions = Array.from(fieldByLabel("Memories Window").querySelectorAll("option"))
+          .map((option) => option.textContent.trim());
+        ["Same Day", "±1 Day", "±2 Days", "±3 Days", "±7 Days"].forEach((option) => {
+          if (memoriesWindowOptions.indexOf(option) === -1) {
+            throw new Error("Memories Window is missing display option: " + option);
+          }
+        });
+        if (Array.from(document.querySelectorAll("label")).some((label) => label.textContent.trim() === "Source")) {
+          throw new Error("Filters should not show a Source selector");
+        }
+        memoriesToggle.click();
+        if (memoriesToggle.getAttribute("aria-checked") !== "true") {
+          throw new Error("Memories toggle should turn on");
+        }
+        await waitFor(() => {
+          const banner = cardByTitle("Memories").querySelector(".setting-info-banner");
+          return banner && getComputedStyle(banner).display !== "none";
+        }, 2000, "Memories warning banner");
+        const activeMemoriesCard = cardByTitle("Memories");
+        const activeFiltersCard = cardByTitle("Filters");
+        const activeMemoriesBanner = activeMemoriesCard.querySelector(".setting-info-banner");
+        if (!activeMemoriesBanner) throw new Error("Memories warning banner is missing while enabled");
+        if (activeMemoriesBanner.textContent.indexOf("Using Memories disables any configured filters") === -1) {
+          throw new Error("Memories warning banner has unexpected text: " + JSON.stringify(activeMemoriesBanner.textContent));
+        }
+        if (getComputedStyle(activeMemoriesBanner).display === "none") {
+          throw new Error("Memories warning banner is hidden while enabled");
+        }
+        if (getComputedStyle(memoriesWindowField).display === "none" ||
+            getComputedStyle(memoriesFallbackField).display === "none") {
+          throw new Error("Memories secondary options should be visible while enabled");
+        }
+        requireText("Memories Window");
+        requireText("Fallback to All Photos");
+        if (!activeFiltersCard.classList.contains("memory-filter-disabled")) {
+          throw new Error("Filters should look disabled while Memories is active");
+        }
+        if (parseFloat(getComputedStyle(activeFiltersCard).opacity) >= 1) {
+          throw new Error("Filters panel should be visibly greyed out while Memories is active");
+        }
+        const filtersBanner = activeFiltersCard.querySelector(".setting-info-banner");
+        if (!filtersBanner || filtersBanner.textContent.indexOf("Using Memories disables any configured filters") === -1 ||
+            getComputedStyle(filtersBanner).display === "none") {
+          throw new Error("Filters should show the Memories warning while enabled");
+        }
+        ["Filter by Date", "Filter by Albums", "Filter by People", "Filter by Tags",
+          "Filter by Favorites", "Filter by Rating", "Filter by Location"].forEach((label) => {
+          requireToggleDisabled(label);
+        });
+        const dateModeButtons = Array.from(fieldByLabel("Mode").querySelectorAll("button"));
+        if (!dateModeButtons.length || dateModeButtons.some((button) => !button.disabled)) {
+          throw new Error("Date filter mode should be disabled while Memories is active");
+        }
+        activeFiltersCard.querySelector(".card-header").click();
+        if (!activeFiltersCard.classList.contains("collapsed")) throw new Error("Disabled Filters should still collapse");
+        const disabledFilterBadge = activeFiltersCard.querySelector(".card-header .on-badge");
+        if (!disabledFilterBadge || getComputedStyle(disabledFilterBadge).display === "none" ||
+            disabledFilterBadge.textContent.trim() !== "Disabled") {
+          throw new Error("Disabled Filters should show a Disabled label while closed");
+        }
+        activeFiltersCard.querySelector(".card-header").click();
+        if (activeFiltersCard.classList.contains("collapsed")) throw new Error("Disabled Filters should still expand");
+        setSelect("Memories Window", "Same Day");
+        toggleByText("Show Memories Only").click();
+        if (toggleByText("Show Memories Only").getAttribute("aria-checked") !== "false") {
+          throw new Error("Memories toggle should turn off");
+        }
+        const inactiveMemoriesBanner = cardByTitle("Memories").querySelector(".setting-info-banner");
+        if (cardByTitle("Filters").classList.contains("memory-filter-disabled") ||
+            !inactiveMemoriesBanner || getComputedStyle(inactiveMemoriesBanner).display !== "none") {
+          throw new Error("Filters should be restored after leaving Memories");
+        }
+        if (getComputedStyle(memoriesWindowField).display !== "none" ||
+            getComputedStyle(memoriesFallbackField).display !== "none") {
+          throw new Error("Memories secondary options should hide after leaving Memories");
+        }
+        memoriesCard.querySelector(".card-header").click();
+        const inactiveMemoriesBadge = memoriesCard.querySelector(".card-header .on-badge");
+        if (!memoriesCard.classList.contains("collapsed") ||
+            !inactiveMemoriesBadge || getComputedStyle(inactiveMemoriesBadge).display !== "none") {
+          throw new Error("Memories ON badge should hide when Memories is disabled");
+        }
+        await waitFor(() => {
+          try {
+            requireLatestPostValue("Photo source", "Photos: Source", "Custom");
+            return true;
+          } catch (_) {
+            return false;
+          }
+        }, 8000, "Custom source after leaving Memories with active filters");
+
+        clickTab("Device");
+        await waitFor(() => pageText().indexOf("Clock") !== -1, 8000, "clock settings");
+        clickTab("Immich");
+        await waitFor(() => pageText().indexOf("Portrait Pairing") !== -1, 8000, "pairing disabled state");
+        const hiddenPairingCard = cardByTitle("Portrait Pairing");
+        const hiddenPairingOptions = hiddenPairingCard.querySelector(".portrait-pairing-options");
+        if (!hiddenPairingOptions || hiddenPairingOptions.style.display !== "none") {
+          throw new Error("Portrait pairing options should be hidden when pairing is off");
+        }
+        if (!hiddenPairingCard.querySelector(".card-body .toggle")) {
+          throw new Error("Portrait pairing master toggle should remain available when options are hidden");
+        }
+        clickTab("Device");
+        await waitFor(() => pageText().indexOf("Clock") !== -1, 8000, "clock settings return");
+        expandCard("Clock");
+        requireText("Show Clock");
+        const advancedClockSettings = disclosureByTitle("Advanced");
+        const advancedClockButton = advancedClockSettings.querySelector(".inline-disclosure-button");
+        if (advancedClockButton.tagName !== "BUTTON" || advancedClockButton.getAttribute("aria-expanded") !== "false") {
+          throw new Error("Clock advanced settings disclosure is not an accessible collapsed button");
+        }
+        expandDisclosure("Advanced");
+        requireText("NTP Servers");
+
+        toggleByText("Show Clock").click();
+        setSelect("Format", "12 Hour");
+        setSelect("Timezone", "UTC (GMT+0)");
+        setInputByAriaLabel("NTP Server 1", "time1.example.com");
+        setInputByAriaLabel("NTP Server 2", "time2.example.com");
+        setInputByAriaLabel("NTP Server 3", "time3.example.com");
+
+        await waitFor(() => {
+          try {
+            requireLatestPostParam("Connection timeout", "Screen: Connection Timeout", "option", "5 minutes");
+            requireLatestPostParam("Slideshow interval", "Photos: Slideshow Interval", "option", "24 hours");
+            requireLatestPostParam("Portrait pairing range", "Photos: Portrait Pairing Range", "option", "Within 2 Days");
+            requirePostContains("Paired portraits only", "Photos: Paired Portraits Only", "turn_on");
+            requirePostContains("Portrait pairing", "Photos: Portrait Pairing", "turn_off");
+            requireLatestPostParam("Photo orientation", "Photos: Orientation", "option", "Landscape Only");
+            requireLatestPostParam("Display mode", "Photos: Display Mode", "option", "Fit");
+            requireLatestPostParam("Metadata date taken format", "Device: Metadata Date Taken Format", "option", "January 1, 2026");
+            requireLatestPostParam("Metadata date format", "Device: Metadata Date Format", "option", "Relative Date");
+            requirePostContains("Metadata location toggle", "Device: Metadata Location", "turn_off");
+            requirePostContains("Metadata date toggle", "Device: Metadata Date", "turn_off");
+            requirePostContains("Show clock toggle", "Clock: Show", "turn_off");
+            requireLatestPostParam("Clock format", "Clock: Format", "option", "12 Hour");
+            requireLatestPostParam("Timezone", "Clock: Timezone", "option", "UTC (GMT+0)");
+            requireLatestPostValue("NTP server 1", "Clock: NTP Server 1", "time1.example.com");
+            requireLatestPostValue("NTP server 2", "Clock: NTP Server 2", "time2.example.com");
+            requireLatestPostValue("NTP server 3", "Clock: NTP Server 3", "time3.example.com");
+            return true;
+          } catch (error) {
+            window.__smoke.lastAssertion = ": " + error.message;
+            return false;
+          }
+        }, 8000, "daily settings saves");
+      }
+      async function requireWizardConnectionSave() {
+        await waitFor(() => pageText().indexOf("connect your photo frame") !== -1, 8000, "wizard connection step");
+        requireText("Immich Server URL");
+        requireText("API Key");
+
+        setInputByLabel("Immich Server URL", "setup.photos.example.com/");
+        setInputByLabel("API Key", "setup-api-key");
+        clickButton("Connect");
+
+        await waitFor(() => pageText().indexOf("Clock & timezone") !== -1, 8000, "wizard clock step");
+        requireLatestPostValue("Wizard server URL", "Connection: Server URL", "https://setup.photos.example.com");
+        requireLatestPostValue("Wizard API key", "Connection: API Key", "setup-api-key");
+
+        clickButton("Done");
+        await waitFor(() => pageText().indexOf("Filters") !== -1, 8000, "settings after wizard");
+      }
+
+      try {
+        if (${JSON.stringify(!!scenario.slowStartup)}) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+          if (document.querySelector("#sp-immich .card")) throw new Error("Settings appeared before snapshot completed");
+          await waitFor(() => pageText().includes("Filters"), 8000, "hydrated settings");
+          const wrap = document.querySelector("#sp-immich .sp-settings-wrap").firstElementChild;
+          if (getComputedStyle(wrap).animationName !== "none") throw new Error("Settings replay a fade animation");
+          const source = window.__smoke.eventSource;
+          source.dispatch("state", { id: "switch/Photos: Portrait Pairing", state: "ON" });
+          await new Promise(resolve => setTimeout(resolve, 150));
+          if (!wrap.isConnected) throw new Error("Duplicate startup state rebuilt settings");
+          source.dispatch("state", { id: "switch/Photos: Portrait Pairing", state: "OFF" });
+          await waitFor(() => !wrap.isConnected, 2000, "changed live setting renders");
+          const metadataWrap = document.querySelector("#sp-immich .sp-settings-wrap").firstElementChild;
+          source.dispatch("state", { id: "select/Device: Metadata Date Format", state: "January 1, 2026" });
+          await waitFor(() => !metadataWrap.isConnected, 2000, "compatibility live setting renders");
+          if (!${JSON.stringify(!!scenario.legacyStartup)} && window.__smoke.fetchedUrls.filter(url => url === "/espframe/api/v1/configuration").length !== 1) {
+            throw new Error("Startup fetched configuration more than once");
+          }
+          if (${JSON.stringify(!!scenario.legacyStartup)} && !window.__smoke.fetchedUrls.some(url => url.includes("Connection: Server URL"))) {
+            throw new Error("Legacy startup did not read the connection URL");
+          }
+          if (${JSON.stringify(!!scenario.startupDelayMs && !scenario.noStartupSse)}) {
+            const initialWrap = document.querySelector("#sp-immich .sp-settings-wrap").firstElementChild;
+            await waitFor(() => document.querySelector("#sp-immich .sp-settings-wrap").firstElementChild !== initialWrap, 8000, "late settings hydration");
+          }
+        } else if (${JSON.stringify(scenario.name)} === "wizard") {
+          await waitFor(() => pageText().indexOf("connect your photo frame") !== -1, 8000, "wizard");
+          requireText("Immich Server URL");
+          requireText("API Key");
+          clickTab("Device");
+          requireText("Import Settings");
+        } else if (${JSON.stringify(scenario.name)}.startsWith("wizard-connection-save")) {
+          await requireWizardConnectionSave();
+        } else if (${JSON.stringify(!!scenario.delayedIdentity)}) {
+          clickTab("Device");
+          await waitFor(() => buttonByText("Export"), 8000, "backup card before identity");
+          if (!buttonByText("Export").disabled) throw new Error("Export enabled before identity settled");
+          buttonByText("Export").click();
+          if (window.__smoke.exportPayloads.length) throw new Error("Export omitted pending identity");
+          window.__smoke.releaseIdentity();
+          await waitFor(() => !buttonByText("Export").disabled, 4000, "export after identity");
+          clickButton("Export");
+          const backup = JSON.parse(window.__smoke.exportPayloads[0]);
+          if (${JSON.stringify(!!scenario.identity)}) {
+            if (backup.identity?.name !== "Office" || !window.__smoke.downloadName.startsWith("office-b2c3-config-")) throw new Error("Delayed identity omitted from backup");
+          } else if (backup.identity || !window.__smoke.downloadName.startsWith("espframe-config-")) throw new Error("Legacy backup fallback failed");
+        } else if (${JSON.stringify(!!scenario.identity)}) {
+          await waitFor(() => document.querySelector("#frame-name"), 8000, "frame name");
+          clickTab("Device");
+          expandCard("Frame Name");
+          const setName = (name) => {
+            const input = document.querySelector("#frame-name");
+            input.value = name;
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+          };
+          const requireHeaderName = name => {
+            const brand = document.querySelector(".sp-brand-label");
+            const deviceName = document.querySelector(".sp-device-name");
+            if (brand.textContent !== "EspFrame" || deviceName.textContent !== name || deviceName.hidden) {
+              throw new Error("Header must retain EspFrame followed by the device name");
+            }
+            if (getComputedStyle(brand).color === getComputedStyle(deviceName).color) throw new Error("Device name must use muted text");
+          };
+          const waitName = async name => {
+            await waitFor(() => document.title === name + " · EspFrame", 4000, "saved frame title");
+            requireHeaderName(name);
+          };
+          requireHeaderName(${JSON.stringify(scenario.initialName || "Espframe")});
+          if (${JSON.stringify(!!scenario.initialName)}) {
+            const deviceName = document.querySelector(".sp-device-name");
+            const nav = document.querySelector(".sp-nav").getBoundingClientRect();
+            if (deviceName.scrollWidth <= deviceName.clientWidth || nav.right > window.innerWidth || nav.left < 0 || document.documentElement.scrollWidth > window.innerWidth + 4) throw new Error("Maximum length name pushes navigation outside header");
+          }
+          if (!buttonByText("Save & Restart").disabled) throw new Error("Unchanged name must disable saving");
+          setName("Living Room");
+          if (!document.querySelector(".frame-name-info").textContent.includes("living-room-b2c3.local")) throw new Error("Missing live hostname preview");
+          clickButton("Save & Restart");
+          if (${JSON.stringify(!!scenario.identityFailure)}) {
+            await waitFor(() => document.querySelector('[role="alert"]')?.textContent, 4000, "save failure");
+            if (window.__smoke.posts.some(url => url.includes("Reboot Screen"))) throw new Error("Failed save restarted the device");
+            if (document.title !== "Espframe · EspFrame") throw new Error("Failed save changed the title");
+            if (document.querySelector("#frame-name").value !== "Living Room") throw new Error("Failed save lost draft");
+            clickButton("Save & Restart");
+          }
+          await waitName("Living Room");
+          await waitFor(() => document.querySelector(".frame-reconnect-dialog[open]"), 4000, "reconnect dialog");
+          const dialog = document.querySelector(".frame-reconnect-dialog");
+          if (!dialog.textContent.includes("Frame name saved") || dialog.textContent.includes("Home Assistant")) throw new Error("Incorrect restart dialog copy");
+          await waitFor(() => window.__smoke.posts.some(url => url.includes("Device: Reboot Screen")), 4000, "automatic restart");
+          if (${JSON.stringify(scenario.name)} === "frame-name-restart-failure") {
+            await waitFor(() => dialog.textContent.includes("restart failed"), 4000, "restart failure recovery");
+          }
+          if (!dialog.querySelector('a[href="http://192.168.1.42/"]')) throw new Error("Missing IP reconnect link");
+          requireText("192.168.1.42");
+          const link = document.querySelector('a[href*="living-room-b2c3.local"]');
+          if (!link) throw new Error("Missing destination hostname");
+          clickButton("Close");
+          await waitFor(() => !document.querySelector(".frame-reconnect-dialog"), 4000, "closed reconnect dialog");
+          clickButton("Export");
+          const backup = JSON.parse(window.__smoke.exportPayloads[0]);
+          if (backup.identity.name !== "Living Room" || !window.__smoke.downloadName.startsWith("living-room-b2c3-config-")) {
+            throw new Error("Named backup is incorrect");
+          }
+          if (${JSON.stringify(!!scenario.importFixture)}) {
+            clickButton("Import");
+            await waitFor(() => document.querySelector("#restore-frame-name"), 4000, "name restore choice");
+            const checkbox = document.querySelector("#restore-frame-name");
+            if (checkbox.checked) throw new Error("Name restore must default to unchecked");
+            checkbox.checked = ${JSON.stringify(!!scenario.restoreName)};
+            clickButton("Import backup");
+            await waitFor(() => pageText().includes("imported"), 4000, "backup completion");
+            await waitName(${JSON.stringify(scenario.restoreName ? "Office" : "Living Room")});
+            const saves = window.__smoke.postRecords.filter(record => record.url === "/espframe/api/v1/identity");
+            if (saves.length !== ${scenario.restoreName ? 2 : 1}) throw new Error("Unexpected name restore write");
+            if (${JSON.stringify(!!scenario.restoreName)} && !document.querySelector(".frame-name-info").textContent.includes("office-b2c3.local")) {
+              throw new Error("Restore did not use destination MAC suffix");
+            }
+          } else {
+            const count = window.__smoke.posts.length;
+            setName("é".repeat(61));
+            if (!buttonByText("Save & Restart").disabled) throw new Error("Invalid name must disable saving");
+            await waitFor(() => document.querySelector('[role="alert"]')?.textContent, 4000, "invalid name");
+            if (window.__smoke.posts.length !== count) throw new Error("Invalid UTF-8 byte length was posted");
+            setName("");
+            clickButton("Save & Restart");
+            await waitName("Espframe");
+            await waitFor(() => document.querySelector("#frame-name").value === "", 4000, "cleared input");
+            if (document.querySelector(".frame-reconnect-dialog")) throw new Error("Clearing back to boot default needs no restart");
+            if (document.documentElement.scrollWidth > window.innerWidth + 4) throw new Error("Name card overflows mobile viewport");
+          }
+        } else if (${JSON.stringify(!!scenario.filterCompatibilityVersion)}) {
+          await waitFor(() => pageText().indexOf("Filters") !== -1, 8000, "photo filters");
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          expandCard("Filters");
+          const structured = ${JSON.stringify(scenario.filterCompatibilityVersion === "3.2.0")};
+          for (const label of ["Albums", "Tags"]) {
+            const toggle = toggleByText("Filter by " + label);
+            if ((toggle.getAttribute("aria-disabled") === "true") !== !structured) {
+              throw new Error(label + " exclusion compatibility guard is incorrect");
+            }
+            if (!structured) {
+              toggle.click();
+              toggle.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+              if (toggle.getAttribute("aria-checked") !== "false") throw new Error("Blocked exclusions were enabled");
+            }
+          }
+          const people = toggleByText("Filter by People");
+          people.click();
+          if (people.getAttribute("aria-checked") !== "false") throw new Error("Active exclusions cannot be disabled");
+          if ((people.getAttribute("aria-disabled") === "true") !== !structured) throw new Error("Disabled exclusions can be re-enabled");
+          if (!structured) {
+            for (const label of ["Albums", "People", "Tags"]) {
+              const noun = label === "Albums" ? "album" : label === "People" ? "person" : "tag";
+              const panel = fieldByLabel("Selected " + label).closest(".filter-group-details");
+              if (getComputedStyle(panel).display === "none") throw new Error("Exclusion recovery is hidden");
+              panel.querySelector('button[aria-label="Remove exclusion"]').click();
+              await waitFor(() => toggleByText("Filter by " + label).getAttribute("aria-disabled") === "false", 4000, noun + " exclusion cleared");
+            }
+            toggleByText("Filter by Albums").click();
+            toggleByText("Filter by People").click();
+            const recovery = fieldByLabel("Inclusion Groups");
+            if (getComputedStyle(recovery).display === "none") throw new Error("Compound matching recovery missing after enabling groups");
+            if (getComputedStyle(recovery.querySelector(".compatibility-disabled")).display === "none") throw new Error("Compound matching warning missing");
+            setSelect("Inclusion Groups", "Match any enabled group");
+            await waitFor(() => {
+              try {
+                requireLatestPostValue("Inclusion recovery", "Photos: Inclusion Groups", "Match any enabled group");
+                return true;
+              } catch (_) { return false; }
+            }, 4000, "inclusion recovery saved");
+          }
+        } else {
+          await waitFor(() => pageText().indexOf("Filters") !== -1, 8000, "settings");
+          expandCard("Connection");
+          requireText("Immich Server URL");
+          expandCard("Filters");
+          requireText("Filter by Date");
+          requireText("Fixed");
+          requireText("Relative");
+
+          if (${JSON.stringify(scenario.name)} === "settings" || ${JSON.stringify(scenario.name)} === "settings-mobile") {
+            requireSettingsSections();
+            const appStyle = getComputedStyle(document.getElementById("sp-app"));
+            if (appStyle.display !== "block" || appStyle.maxWidth !== "1080px" || getComputedStyle(document.body).fontFamily.includes("Inter")) {
+              throw new Error("Settings should use the centered 1080px layout and system fonts");
+            }
+            const sections = Array.from(document.querySelectorAll("#sp-settings .settings-section"));
+            const sectionGap = window.matchMedia("(max-width:480px)").matches ? "40px" : "48px";
+            if (sections.slice(0, -1).some(section => getComputedStyle(section).marginBottom !== sectionGap)) {
+              throw new Error("Settings sections should have clear responsive separation");
+            }
+            if (getComputedStyle(sections[sections.length - 1]).marginBottom !== "0px") {
+              throw new Error("Last settings section should not add trailing space");
+            }
+            const input = document.querySelector("#sp-immich input[type='url']");
+            if (!input || getComputedStyle(input).borderRadius !== "10px") {
+              throw new Error("Settings inputs should retain compact rounded corners");
+            }
+            await requireFirmwarePanels();
+            const actionButtons = Array.from(document.querySelectorAll("#sp-settings .btn"));
+            if (!actionButtons.length || actionButtons.some(button => getComputedStyle(button).borderRadius !== "9999px")) {
+              throw new Error("Settings, backup and firmware actions should have pill ends");
+            }
+            const focusButton = actionButtons.find(button => !button.disabled && button.getClientRects().length);
+            focusButton.focus();
+            if (!focusButton.matches(":focus-visible") || getComputedStyle(focusButton).outlineStyle !== "solid" ||
+                getComputedStyle(focusButton).outlineWidth !== "2px") {
+              throw new Error("Keyboard-focused actions should have a visible focus ring");
+            }
+            focusButton.blur();
+            toggleInDisclosure("Auto updates", "Auto Update").click();
+            toggleInDisclosure("WiFi firmware", "Auto Update").click();
+            await waitFor(() => hasConfigurationPost("Firmware: Auto Update") && hasConfigurationPost("WiFi Firmware: Auto Update"), 4000, "firmware automatic update saves");
+            if (${JSON.stringify(scenario.name)} === "settings-mobile" && document.documentElement.scrollWidth > window.innerWidth + 4) {
+              throw new Error("Grouped settings overflow the mobile viewport");
+            }
+            clickButton("Export");
+            clickButton("Import");
+            if (window.__smoke.downloads !== 1) throw new Error("Export did not trigger a download");
+            requireExportShape();
+            if (window.__smoke.inputClicks !== 1) throw new Error("Import did not open the file picker");
+            const logsTab = Array.from(document.querySelectorAll(".sp-tab")).find((tab) => tab.textContent.trim() === "Logs");
+            if (!logsTab) throw new Error("Logs tab not found");
+            logsTab.click();
+            requireText("Clear");
+            await waitFor(() => pageText().indexOf("Smoke log line") !== -1, 8000, "log line");
+            if (${JSON.stringify(scenario.name)} === "settings-mobile") {
+              if (document.documentElement.scrollWidth > window.innerWidth + 4) {
+                throw new Error("Mobile viewport has horizontal overflow");
+              }
+            }
+          }
+
+          if (${JSON.stringify(scenario.name)} === "firmware-main-install" || ${JSON.stringify(scenario.name)} === "firmware-main-install-from-development-build") {
+            await requireFirmwarePanels();
+            const install = disclosureByTitle("Firmware updates").querySelector(".fw-actions button");
+            if (${JSON.stringify(scenario.name)} === "firmware-main-install-from-development-build") {
+              if (install.textContent.trim() !== "Install Update") throw new Error("Development build should expose the public firmware install action");
+            }
+            install.click();
+            install.click();
+            await waitFor(() => window.__smoke.posts.includes("/update"), 8000, "main firmware install");
+            const installPosts = window.__smoke.posts.filter((url) => url.indexOf("Firmware: Update/install") !== -1);
+            const uploadPosts = window.__smoke.posts.filter((url) => url === "/update");
+            if (installPosts.length !== 0 || uploadPosts.length !== 1 || !window.__smoke.posts.some((url) => url.indexOf("Firmware: Prepare Browser Update/press") !== -1)) {
+              throw new Error("Main firmware install did not use the advertised public asset: " + JSON.stringify(window.__smoke.posts));
+            }
+          }
+
+          if (${JSON.stringify(scenario.name)} === "firmware-index-replaces-stale-device") {
+            await requireFirmwarePanels();
+            const updates = expandDisclosure("Firmware updates");
+            if (updates.textContent.indexOf("v1.0.2") === -1 || updates.querySelector(".fw-actions button").textContent.trim() !== "Install Update") {
+              throw new Error("The version index did not replace stale device metadata");
+            }
+            updates.querySelector(".fw-actions button").click();
+            await waitFor(() => window.__smoke.posts.includes("/update"), 8000, "indexed firmware install");
+            if (window.__smoke.posts.some((url) => url.indexOf("Firmware: Update/install") !== -1)) {
+              throw new Error("Indexed firmware install used stale device metadata");
+            }
+          }
+
+          if (${JSON.stringify(scenario.name)} === "firmware-c6-install") {
+            await requireFirmwarePanels();
+            const install = disclosureByTitle("WiFi firmware").querySelector(".fw-actions button");
+            install.click();
+            install.click();
+            await waitFor(() => window.__smoke.posts.some((url) => url.indexOf("Firmware ESP32-C6: Install Update") !== -1), 4000, "WiFi firmware install");
+            const installPosts = window.__smoke.posts.filter((url) => url.indexOf("Firmware ESP32-C6: Install Update") !== -1);
+            if (installPosts.length !== 1 || !install.disabled) throw new Error("WiFi firmware install was not protected against repeated actions");
+          }
+
+          if (${JSON.stringify(scenario.name)} === "firmware-rollback" || ${JSON.stringify(scenario.name)} === "firmware-rollback-failure") {
+            await requireFirmwarePanels();
+            window.confirm = () => true;
+            disclosureByTitle("Previous firmware").querySelector(".fw-previous-actions button").click();
+            await waitFor(() => window.__smoke.posts.includes("/update"), 4000, "rollback upload");
+            const prepareIndex = window.__smoke.posts.findIndex((url) => url.indexOf("Firmware: Prepare Browser Update/press") !== -1);
+            const uploadIndex = window.__smoke.posts.indexOf("/update");
+            if (prepareIndex === -1 || prepareIndex > uploadIndex) {
+              throw new Error("Rollback upload did not persist reboot recovery state first");
+            }
+            if (${JSON.stringify(scenario.name)} === "firmware-rollback-failure") {
+              await waitFor(() => pageText().indexOf("Device rejected firmware upload (500)") !== -1, 4000, "rollback upload failure");
+              const cancelIndex = window.__smoke.posts.findIndex((url) => url.indexOf("Firmware: Cancel Browser Update/press") !== -1);
+              if (cancelIndex === -1 || cancelIndex < uploadIndex) {
+                throw new Error("Rejected rollback upload did not clear reboot recovery state");
+              }
+            } else {
+              await waitFor(() => pageText().indexOf("Waiting for the display to restart") !== -1, 4000, "rollback reboot wait");
+              if (window.__smoke.posts.some((url) => url.indexOf("Firmware: Cancel Browser Update/press") !== -1)) {
+                throw new Error("Successful rollback upload unexpectedly cleared reboot recovery state");
+              }
+            }
+          }
+
+          if (${JSON.stringify(scenario.name)} === "firmware-index-unavailable") {
+            const card = expandCard("Firmware");
+            await new Promise((resolve) => setTimeout(resolve, 200));
+            if (Array.from(card.querySelectorAll(".inline-disclosure")).some((item) => item.textContent.indexOf("Previous firmware") !== -1 && item.style.display !== "none")) {
+              throw new Error("Previous firmware panel should be hidden when the version index is unavailable");
+            }
+            const updates = expandDisclosure("Firmware updates");
+            const install = Array.from(updates.querySelectorAll("button")).find((button) => button.textContent.trim() === "Install Update");
+            if (!install) {
+              throw new Error("The stable manifest did not expose an install action without the version index");
+            }
+            install.click();
+            await waitFor(() => window.__smoke.posts.includes("/update"), 8000, "manifest OTA fallback upload");
+          }
+
+          if (${JSON.stringify(scenario.name)} === "firmware-manifest-sse-update") {
+            await requireFirmwarePanels();
+            await new Promise((resolve) => setTimeout(resolve, 250));
+            const updates = expandDisclosure("Firmware updates");
+            if (updates.textContent.indexOf("v1.0.1") === -1 ||
+                updates.querySelector(".fw-actions button").textContent.trim() !== "Install Update") {
+              throw new Error("A stale firmware SSE event replaced the public manifest update");
+            }
+          }
+
+          if (${JSON.stringify(scenario.name)} === "firmware-newer-prerelease") {
+            const card = expandCard("Firmware");
+            await waitFor(() => card.textContent.indexOf("v1.0.1") !== -1, 4000, "stable firmware version index");
+            const updates = expandDisclosure("Firmware updates");
+            const action = updates.querySelector(".fw-actions button");
+            if (!action || action.textContent.trim() !== "Check for Update") {
+              throw new Error("An older stable release was offered as an update to a newer prerelease");
+            }
+            if (updates.querySelector(".disclosure-badge.active")) {
+              throw new Error("An older stable release activated the update badge");
+            }
+            const previous = expandDisclosure("Previous firmware");
+            const stableRollback = Array.from(previous.querySelectorAll("option")).find((option) => option.value === "v1.0.1");
+            if (!stableRollback) {
+              throw new Error("The latest stable release was missing from prerelease rollback choices");
+            }
+            action.click();
+            await waitFor(() => window.__smoke.posts.some((url) => url.indexOf("Firmware: Check for Update/press") !== -1), 4000, "prerelease update check");
+            await new Promise((resolve) => setTimeout(resolve, 4500));
+            if (window.__smoke.posts.includes("/update") || window.__smoke.posts.some((url) => url.indexOf("Firmware: Update/install") !== -1)) {
+              throw new Error("Checking from a newer prerelease started a downgrade");
+            }
+          }
+
+          if (${JSON.stringify(scenario.name)} === "firmware-second-device-index") {
+            await requireFirmwarePanels();
+            if (!window.__smoke.fetchedUrls.some((url) => url.indexOf(${JSON.stringify(expectedFirmwareVersionsPath)}) !== -1)) {
+              throw new Error("Firmware history was not loaded from the installed panel's release index");
+            }
+          }
+
+          if (${JSON.stringify(scenario.name)} === "photo-source-reorder") {
+            await requireAlbumReorderSave();
+            requireIncludedPanel("Albums", "Selected Albums", false);
+            requireIncludedPanel("People", "Selected People", false);
+            requireIncludedPanel("Tags", "Selected Tags", false);
+            requireAlbumOrderAfterExclusions();
+            requireNoAdvancedInclusionPanel();
+          }
+
+          if (${JSON.stringify(scenario.name)} === "screen-rotation-developer") {
+            await requireScreenRotationDeveloperFlow();
+          }
+
+          if (${JSON.stringify(scenario.name)} === "screen-tone-schedule") {
+            await requireScreenToneScheduleControls();
+          }
+
+          if (${JSON.stringify(scenario.name)} === "daily-settings-controls") {
+            await requireDailySettingsControls();
+          }
+
+          if (${JSON.stringify(scenario.name)} === "connection-overlapping-url-saves") {
+            clickTab("Immich");
+            expandCard("Connection");
+            const input = fieldByLabel("Immich Server URL").querySelector("input");
+            const first = "https://first.example.test";
+            const second = "https://second.example.test";
+            input.value = first;
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+            input.value = second;
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+            await waitFor(() => window.__smoke.postRecords.some(record =>
+              new URLSearchParams(record.body).get("value") === second), 6000, "second queued connection save");
+            if (input.value !== second) throw new Error("Older connection save overwrote the newer input");
+            await waitFor(() => pageText().includes("URL saved"), 4000, "verified connection save");
+            if (pageText().includes("Failed to save setting") || pageText().includes("Failed to save URL")) {
+              throw new Error("Overlapping URL saves produced a spurious failure");
+            }
+          }
+
+          if (${JSON.stringify(scenario.name)} === "settings-accessibility") {
+            clickTab("Device");
+            const card = cardByTitle("Backup");
+            const toggle = card.querySelector(".card-toggle");
+            if (!toggle || toggle.tagName !== "BUTTON") throw new Error("Card needs a native keyboard button");
+            toggle.focus();
+            if (document.activeElement !== toggle) throw new Error("Card toggle cannot receive focus");
+            const before = toggle.getAttribute("aria-expanded");
+            toggle.click();
+            if (toggle.getAttribute("aria-expanded") === before) throw new Error("Card expanded state did not change");
+            if (document.getElementById(toggle.getAttribute("aria-controls")) !== card.querySelector(".card-body")) {
+              throw new Error("Card toggle is not associated with its content");
+            }
+            const labels = Array.from(document.querySelectorAll(".field > label"));
+            for (const label of labels) {
+              const input = label.parentElement.querySelector("input,select,textarea");
+              if (input && label.control !== input) throw new Error("Unassociated field: " + label.textContent);
+            }
+          }
+          if (${JSON.stringify(scenario.name)} === "setting-save-rejected") {
+            clickTab("Device");
+            const card = expandCard("Screen Brightness");
+            const slider = card.querySelector('input[type="range"]');
+            const previous = slider.value;
+            slider.value = previous === "40" ? "50" : "40";
+            slider.dispatchEvent(new Event("change", { bubbles: true }));
+            await waitFor(() => pageText().includes("Failed to save setting"), 4000, "save error feedback");
+            await waitFor(() => cardByTitle("Screen Brightness").querySelector('input[type="range"]').value === previous,
+              4000, "rejected setting rollback");
+          }
+
+          if (${JSON.stringify(scenario.name)} === "backup-import-v2-exclusions") {
+            clickButton("Import");
+            await waitFor(() => pageText().indexOf("Settings imported successfully") !== -1, 8000, "v2 exclusion import");
+            ["Albums", "People", "Tags"].forEach((group) => {
+              requirePostContains(group + " restored toggle", "Photos: " + group + " Enabled", "turn_on");
+            });
+            ["Album", "Person", "Tag"].forEach((noun) => {
+              requireLatestPostValue(noun + " restored exclusion", "Photos: Excluded " + noun + " IDs", ${JSON.stringify(smokeAlbumIds[0])});
+            });
+          }
+
+          if (${JSON.stringify(scenario.name)} === "backup-import-success") {
+            clickButton("Import");
+            await waitFor(() => pageText().indexOf("Settings imported successfully") !== -1, 8000, "successful import");
+            if (!hasConfigurationPost("Connection: Server URL")) {
+              throw new Error("Import did not post connection URL");
+            }
+            requirePostContains("Import text field", "Connection: Server URL");
+            requirePostContains("Import switch field", "Firmware: Auto Update", "turn_on");
+            requirePostContains("Import select field", "Photos: Source", "option=Person");
+            requirePostContains("Import number field", "Screen: Daytime Brightness", "value=90");
+            requirePostContains("Import aggregate NTP field", "Clock: NTP Server 1");
+            requirePostContains("Import WiFi auto-update field", "WiFi Firmware: Auto Update", "turn_on");
+            requirePostContains("Import normalized schedule setting", "Screen: Schedule Wake Timeout", "value=120");
+          }
+
+          if (${JSON.stringify(scenario.name)} === "backup-import-save-failure") {
+            clickButton("Import");
+            await waitFor(() => pageText().indexOf("Imported with 1 failed setting") !== -1, 8000, "failed import save");
+            requirePostContains("Failed import still attempted daytime brightness", "Screen: Daytime Brightness", "value=90");
+          }
+
+          if (${JSON.stringify(scenario.name)} === "backup-import-partial") {
+            clickButton("Import");
+            await waitFor(() => pageText().indexOf("Imported with 1 skipped setting") !== -1, 8000, "partial import");
+            requirePostContains("Partial import text field", "Connection: Server URL");
+            if (hasConfigurationPost("Photos: Album IDs")) {
+              throw new Error("Skipped album IDs were posted to the device");
+            }
+          }
+
+          if (${JSON.stringify(scenario.name)} === "backup-import-rejected") {
+            clickButton("Import");
+            await waitFor(() => pageText().indexOf("Import skipped 1 setting") !== -1, 8000, "rejected import");
+            if (hasConfigurationPost("Photos: Album IDs")) {
+              throw new Error("Rejected album IDs were posted to the device");
+            }
+          }
+
+          if (${JSON.stringify(scenario.name)} === "backup-import-missing-version") {
+            clickButton("Import");
+            await waitFor(() => pageText().indexOf("Invalid config file - missing version") !== -1, 8000, "missing version rejection");
+            if (window.__smoke.posts.length) throw new Error("Missing-version backup wrote settings to the device");
+          }
+
+          if (${JSON.stringify(scenario.name)} === "backup-import-future-version") {
+            clickButton("Import");
+            await waitFor(() => pageText().indexOf("Unsupported backup version 4 - this device supports version 3") !== -1, 8000, "future version rejection");
+            if (window.__smoke.posts.length) throw new Error("Future-version backup wrote settings to the device");
+          }
+
+          if (${JSON.stringify(scenario.name)} === "backup-import-unsupported-version") {
+            clickButton("Import");
+            await waitFor(() => pageText().indexOf("Unsupported backup version 0") !== -1, 8000, "unsupported version rejection");
+            if (window.__smoke.posts.length) throw new Error("Unsupported-version backup wrote settings to the device");
+          }
+        }
+        if (window.__smoke.errors.length) throw new Error(window.__smoke.errors.join("; "));
+        document.documentElement.setAttribute("data-smoke-${scenario.name}", "pass");
+        document.body.appendChild(document.createTextNode(" ESPFRAME_BROWSER_SMOKE_${scenario.name.toUpperCase().replace(/-/g, "_")}_PASS "));
+      } catch (error) {
+        document.documentElement.setAttribute("data-smoke-${scenario.name}", "fail");
+        document.title = "ESPFRAME_SMOKE_ERROR: " + (error && error.message ? error.message : String(error));
+        const pre = document.createElement("pre");
+        pre.id = "smoke-error-${scenario.name}";
+        pre.textContent = error && error.stack ? error.stack : String(error);
+        document.body.appendChild(pre);
+      }
+    })();
+  `;
+}
+
+function htmlForScenario(scenario) {
+  const escapedAppSource = appSource.replace(/<\/script/gi, "<\\/script");
+  return `<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Espframe web smoke ${scenario.name}</title></head>
+<body><esp-app></esp-app>
+<script>${browserScriptForScenario(scenario)}</script>
+<script>${escapedAppSource}</script>
+<script>${smokeAssertionsForScenario(scenario)}</script>
+</body>
+</html>`;
+}
+
+function runChrome(args, timeoutMs) {
+  return new Promise((resolve) => {
+    const useProcessGroup = process.platform !== "win32";
+    const child = spawn(requireChromePath(), args, {
+      detached: useProcessGroup,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timer = null;
+    let forceResolveTimer = null;
+    let timedOut = false;
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+
+    function finish(result) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(forceResolveTimer);
+      resolve(result);
+    }
+
+    timer = setTimeout(() => {
+      const domCompleted = /data-smoke-[a-z0-9-]+="pass"/.test(stdout);
+      timedOut = !domCompleted;
+      stderr += `\nChrome timed out after ${timeoutMs}ms`;
+      if (useProcessGroup) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch (_) {
+          // Fall back to killing the browser wrapper if the process group is already gone.
+          child.kill("SIGKILL");
+        }
+      } else {
+        child.kill("SIGKILL");
+      }
+      forceResolveTimer = setTimeout(() => {
+        finish({
+          status: domCompleted ? 0 : null,
+          signal: domCompleted ? null : "timeout",
+          stdout,
+          stderr,
+          timedOut,
+        });
+      }, 1000);
+    }, timeoutMs);
+
+    child.on("close", (status, signal) => {
+      finish({ status, signal, stdout, stderr, timedOut });
+    });
+  });
+}
+
+async function runScenario(scenario) {
+  console.log(`running web browser smoke scenario: ${scenario.name}`);
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "espframe-web-smoke-"));
+  const htmlPath = path.join(tempDir, `${scenario.name}.html`);
+  const userDataDir = path.join(tempDir, "chrome-profile");
+  const query = scenario.query ? `?${scenario.query}` : "";
+  fs.writeFileSync(htmlPath, htmlForScenario(scenario));
+  const result = await runChrome(
+    [
+      "--headless=new",
+      "--disable-gpu",
+      "--disable-background-networking",
+      "--disable-sync",
+      "--disable-component-update",
+      "--disable-domain-reliability",
+      "--disable-component-extensions-with-background-pages",
+      "--disable-default-apps",
+      "--disable-extensions",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--no-service-autorun",
+      ...chromeSandboxArgs(),
+      `--user-data-dir=${userDataDir}`,
+      `--window-size=${scenario.width},${scenario.height}`,
+      // Advance virtual time far enough for the startup hydration and all
+      // smoke assertions, including the intentionally delayed scenario.
+      "--virtual-time-budget=20000",
+      "--dump-dom",
+      `file://${htmlPath}${query}`,
+    ],
+    30000
+  );
+
+  const output = `${result.stdout || ""}\n${result.stderr || ""}`;
+  const renderedOutput = output.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "");
+  const passToken = `ESPFRAME_BROWSER_SMOKE_${scenario.name.toUpperCase().replace(/-/g, "_")}_PASS`;
+  if (!renderedOutput.includes(passToken)) {
+    assert.equal(result.timedOut, false, `Chrome timed out for ${scenario.name}:\n${output}`);
+    assert.equal(result.status, 0, `Chrome failed for ${scenario.name} (signal: ${result.signal || "none"}):\n${output}`);
+  }
+  // Startup regressions must verify the executed DOM result, not the pass
+  // marker also present in the inline assertion script.
+  assert.ok(scenario.slowStartup ? renderedOutput.includes(`data-smoke-${scenario.name}="pass"`) : renderedOutput.includes(passToken), `Browser smoke scenario ${scenario.name} failed:\n${output}`);
+}
+
+function selectedScenariosFromArgs(args) {
+  const selectedNames = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === "--list") {
+      scenarios.forEach((scenario) => console.log(scenario.name));
+      return [];
+    }
+    if (arg === "--scenario") {
+      const value = args[i + 1];
+      if (!value) throw new Error("--scenario requires a scenario name");
+      selectedNames.push(value);
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--scenario=")) {
+      const value = arg.slice("--scenario=".length);
+      if (!value) throw new Error("--scenario requires a scenario name");
+      selectedNames.push(value);
+      continue;
+    }
+    throw new Error(`Unknown browser smoke option: ${arg}`);
+  }
+  if (!selectedNames.length) return scenarios;
+  const scenarioByName = new Map(scenarios.map((scenario) => [scenario.name, scenario]));
+  return selectedNames.map((name) => {
+    const scenario = scenarioByName.get(name);
+    if (!scenario) {
+      throw new Error(`Unknown browser smoke scenario: ${name}. Run with --list to see available scenarios.`);
+    }
+    return scenario;
+  });
+}
+
+async function main(args = process.argv.slice(2)) {
+  const selectedScenarios = selectedScenariosFromArgs(args);
+  for (const scenario of selectedScenarios) {
+    await runScenario(scenario);
+  }
+  if (selectedScenarios.length) console.log("web browser smoke tests passed");
+}
+
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  main,
+  scenarios,
+  selectedScenariosFromArgs,
+};
