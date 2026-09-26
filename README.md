@@ -8,6 +8,12 @@ Espframe is for people who want their photos out in the room, not hidden on a ph
   <img src="docs/public/espframe.png" alt="Espframe displaying Immich photos on a Guition ESP32-P4 touchscreen" width="700" />
 </p>
 
+## About This Fork
+
+This is a fork of the original [Espframe](https://github.com/jtenniswood/espframe) by [jtenniswood](https://github.com/jtenniswood/espframe).
+
+It adds support for the **V3** Guition 10" panel — SKU **`10153002-V3`** (rear-case marking **`2538`**) — which runs ESP32-P4 V3 production silicon, and adds a local SD-card photo mode that reads photos directly from an SD card.
+
 ## What Espframe Lets You Do
 
 - **Make a real photo frame from your Immich library**  
